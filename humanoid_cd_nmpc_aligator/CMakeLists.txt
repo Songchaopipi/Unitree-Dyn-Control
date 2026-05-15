@@ -118,6 +118,7 @@ add_executable(proxddp_centroidal_layer1
 )
 
 target_include_directories(proxddp_centroidal_layer1 PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/include"
   "${OPENLOONG_ROOT}/third_party/eigen3"
   "/usr/local/include"
   "${OPENLOONG_ROOT}/third_party/boost"
