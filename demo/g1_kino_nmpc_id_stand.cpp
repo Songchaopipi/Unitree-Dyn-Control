@@ -61,7 +61,7 @@ struct RuntimeOptions
     double wrenchSign{-1.0};
     double nmpcTolerance{1e-5};
     double nmpcMuInit{1e-8};
-    int nmpcMaxIterations{5};
+    int nmpcMaxIterations{1};
     int nmpcMaxAlIterations{2};
     double printHz{kDefaultPrintHz};
 };

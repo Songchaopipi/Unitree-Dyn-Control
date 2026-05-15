@@ -7,11 +7,22 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 */
 #include "data_logger.h"
 
+#include <filesystem>
+
 DataLogger::DataLogger(std::string fileNameIn) {
     filePath=fileNameIn;
-    size_t lastSlashPos = filePath.find_last_of('/');
-    fileFolder=filePath.substr(0, lastSlashPos);
-    fileName=filePath.substr(lastSlashPos + 1);
+    const std::filesystem::path path(filePath);
+    fileFolder = path.has_parent_path() ? path.parent_path().string() : ".";
+    fileName = path.filename().string();
+    if (!fileFolder.empty() && fileFolder != ".")
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(fileFolder, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to create log directory: " + fileFolder + ", error: " + ec.message());
+        }
+    }
     file_handler = quill::file_handler(filePath, "w");
     file_handler->set_pattern(QUILL_STRING("%(message)")); // timestamp's timezone
     quill::set_default_logger_handler(file_handler);
@@ -120,7 +131,6 @@ void DataLogger::finishLine() {
     tmpStr = fmt::format("{:.6e}", fmt::join(recValue, ","));
     LOG_INFO(dl, "{}", tmpStr);
 }
-
 
 
 

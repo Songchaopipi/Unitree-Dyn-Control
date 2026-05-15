@@ -5,17 +5,16 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <sstream>
 
+#include <aligator/core/cost-abstract.hpp>
+#include <aligator/core/explicit-dynamics.hpp>
 #include <aligator/core/traj-opt-problem.hpp>
 #include <aligator/modelling/centroidal/centroidal-wrench-cone.hpp>
 #include <aligator/modelling/constraints/box-constraint.hpp>
 #include <aligator/modelling/constraints/equality-constraint.hpp>
 #include <aligator/modelling/constraints/negative-orthant.hpp>
-#include <aligator/modelling/costs/quad-residual-cost.hpp>
-#include <aligator/modelling/costs/quad-state-cost.hpp>
-#include <aligator/modelling/costs/sum-of-costs.hpp>
-#include <aligator/modelling/dynamics/integrator-semi-euler.hpp>
 #include <aligator/modelling/dynamics/kinodynamics-fwd.hpp>
 #include <aligator/modelling/function-xpr-slice.hpp>
 #include <aligator/modelling/multibody/centroidal-momentum.hpp>
@@ -23,7 +22,6 @@
 #include <aligator/modelling/multibody/frame-placement.hpp>
 #include <aligator/modelling/multibody/frame-velocity.hpp>
 #include <aligator/modelling/spaces/multibody.hpp>
-#include <aligator/modelling/state-error.hpp>
 #include <aligator/solvers/proxddp/solver-proxddp.hpp>
 
 #include <pinocchio/algorithm/joint-configuration.hpp>
@@ -32,15 +30,18 @@ namespace
 {
 using Vector6d = Eigen::Matrix<double, 6, 1>;
 using Space = aligator::MultibodyPhaseSpace<double>;
-using CostStack = aligator::CostStackTpl<double>;
 using StageModel = aligator::StageModelTpl<double>;
 using TrajOptProblem = aligator::TrajOptProblemTpl<double>;
 using SolverProxDDP = aligator::SolverProxDDPTpl<double>;
 using KinodynamicsFwdDynamics = aligator::dynamics::KinodynamicsFwdDynamicsTpl<double>;
-using IntegratorSemiImplEuler = aligator::dynamics::IntegratorSemiImplEulerTpl<double>;
-using QuadraticStateCost = aligator::QuadraticStateCostTpl<double>;
-using QuadraticControlCost = aligator::QuadraticControlCostTpl<double>;
-using QuadraticResidualCost = aligator::QuadraticResidualCostTpl<double>;
+using ContinuousDynamicsData = aligator::dynamics::ContinuousDynamicsDataTpl<double>;
+using CostAbstract = aligator::CostAbstractTpl<double>;
+using CostDataAbstract = aligator::CostDataAbstractTpl<double>;
+using ExplicitDynamicsModel = aligator::ExplicitDynamicsModelTpl<double>;
+using ExplicitDynamicsData = aligator::ExplicitDynamicsDataTpl<double>;
+using StageFunctionData = aligator::StageFunctionDataTpl<double>;
+using CentroidalMomentumResidual = aligator::CentroidalMomentumResidualTpl<double>;
+using CentroidalMomentumDerivativeResidual = aligator::CentroidalMomentumDerivativeResidualTpl<double>;
 using FramePlacementResidual = aligator::FramePlacementResidualTpl<double>;
 
 class ControlSliceResidual final : public aligator::StageFunctionTpl<double>
@@ -69,6 +70,408 @@ public:
 private:
     int offset_{0};
     int size_{0};
+};
+
+struct DirectSemiImplicitKinodynamicsData;
+
+class DirectSemiImplicitKinodynamics final : public ExplicitDynamicsModel
+{
+public:
+    using Base = ExplicitDynamicsModel;
+    using Data = ExplicitDynamicsData;
+
+    DirectSemiImplicitKinodynamics(const Space &space,
+                                   const pinocchio::Model &model,
+                                   const Eigen::Vector3d &gravity,
+                                   const std::vector<bool> &contactStates,
+                                   const std::vector<pinocchio::FrameIndex> &contactIds,
+                                   int forceSize,
+                                   double dt)
+        : Base(space, model.nv - 6 + static_cast<int>(contactStates.size()) * forceSize),
+          ode_(space, model, gravity, contactStates, contactIds, forceSize),
+          timestep_(dt)
+    {
+        if (space.ndx() % 2 != 0)
+        {
+            throw std::invalid_argument("DirectSemiImplicitKinodynamics requires even tangent dimension");
+        }
+        if (!(timestep_ > 0.0))
+        {
+            throw std::invalid_argument("DirectSemiImplicitKinodynamics requires positive dt");
+        }
+    }
+
+    void forward(const ConstVectorRef &x, const ConstVectorRef &u, Data &data) const override;
+    void dForward(const ConstVectorRef &x, const ConstVectorRef &u, Data &data) const override;
+    std::shared_ptr<Data> createData() const override;
+
+    const KinodynamicsFwdDynamics &continuousDynamics() const { return ode_; }
+
+private:
+    void computeForwardState(const ConstVectorRef &x,
+                             const ConstVectorRef &u,
+                             DirectSemiImplicitKinodynamicsData &data,
+                             ContinuousDynamicsData &continuousData) const;
+
+    KinodynamicsFwdDynamics ode_;
+    double timestep_{0.0};
+};
+
+struct DirectSemiImplicitKinodynamicsData final : ExplicitDynamicsData
+{
+    explicit DirectSemiImplicitKinodynamicsData(const DirectSemiImplicitKinodynamics &model)
+        : ExplicitDynamicsData(model),
+          continuousData(model.continuousDynamics().createData()),
+          dx(model.ndx1()),
+          JtmpXnext2(model.ndx2(), model.ndx1()),
+          JtmpU(model.ndx2(), model.nu)
+    {
+        dx.setZero();
+        JtmpXnext2.setZero();
+        JtmpU.setZero();
+    }
+
+    std::shared_ptr<ContinuousDynamicsData> continuousData;
+    Eigen::VectorXd dx;
+    Eigen::MatrixXd JtmpXnext2;
+    Eigen::MatrixXd JtmpU;
+};
+
+void DirectSemiImplicitKinodynamics::computeForwardState(
+    const ConstVectorRef &x,
+    const ConstVectorRef &u,
+    DirectSemiImplicitKinodynamicsData &data,
+    ContinuousDynamicsData &continuousData) const
+{
+    ode_.forward(x, u, continuousData);
+
+    const int ndx = ndx1();
+    const int half = ndx / 2;
+    data.dx.setZero();
+    data.dx.bottomRows(half) = continuousData.xdot_.bottomRows(half) * timestep_;
+    space_next().integrate(x, data.dx, data.xnext_);
+    data.dx.topRows(half) = data.xnext_.bottomRows(half) * timestep_;
+    space_next().integrate(x, data.dx, data.xnext_);
+}
+
+void DirectSemiImplicitKinodynamics::forward(
+    const ConstVectorRef &x,
+    const ConstVectorRef &u,
+    Data &data) const
+{
+    auto &directData = static_cast<DirectSemiImplicitKinodynamicsData &>(data);
+    computeForwardState(x, u, directData, *directData.continuousData);
+}
+
+void DirectSemiImplicitKinodynamics::dForward(
+    const ConstVectorRef &x,
+    const ConstVectorRef &u,
+    Data &data) const
+{
+    auto &directData = static_cast<DirectSemiImplicitKinodynamicsData &>(data);
+    ContinuousDynamicsData &continuousData = *directData.continuousData;
+    ode_.dForward(x, u, continuousData);
+
+    const int ndx = ndx1();
+    const int half = ndx / 2;
+    const auto &space = space_next();
+
+    directData.Jx() = timestep_ * continuousData.Jx();
+    directData.Ju() = timestep_ * continuousData.Ju();
+    space.JintegrateTransport(x, directData.dx, directData.Jx(), 1);
+    space.JintegrateTransport(x, directData.dx, directData.Ju(), 1);
+    space.Jintegrate(x, directData.dx, directData.Jtmp_xnext, 0);
+    directData.Jx() += directData.Jtmp_xnext;
+
+    directData.JtmpXnext2.setZero();
+    directData.JtmpU.setZero();
+    directData.JtmpXnext2.topRows(half) = timestep_ * directData.Jx().bottomRows(half);
+    directData.JtmpXnext2.bottomRows(half) = timestep_ * continuousData.Jx().bottomRows(half);
+    directData.JtmpU.topRows(half) = timestep_ * directData.Ju().bottomRows(half);
+    directData.JtmpU.bottomRows(half) = timestep_ * continuousData.Ju().bottomRows(half);
+
+    space.JintegrateTransport(x, directData.dx, directData.JtmpXnext2, 1);
+    space.JintegrateTransport(x, directData.dx, directData.JtmpU, 1);
+    directData.JtmpXnext2 += directData.Jtmp_xnext;
+    directData.Jx().topRows(half) = directData.JtmpXnext2.topRows(half);
+    directData.Ju().topRows(half) = directData.JtmpU.topRows(half);
+}
+
+std::shared_ptr<ExplicitDynamicsData> DirectSemiImplicitKinodynamics::createData() const
+{
+    return std::make_shared<DirectSemiImplicitKinodynamicsData>(*this);
+}
+
+struct DirectKinoCostReferences
+{
+    Eigen::VectorXd xRef;
+    Eigen::VectorXd uRef;
+    std::array<pinocchio::SE3, G1KinodynamicsNmpc::kNumFeet> footPoseReference{
+        pinocchio::SE3::Identity(), pinocchio::SE3::Identity()};
+    Eigen::MatrixXd stateWeight;
+    Eigen::MatrixXd controlWeight;
+    Eigen::MatrixXd terminalWeight;
+    Eigen::Matrix<double, 6, 6> centroidalWeight = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 6> centroidalDerivativeWeight = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 6> footPoseWeight = Eigen::Matrix<double, 6, 6>::Zero();
+};
+
+void resetCostData(CostDataAbstract &data)
+{
+    data.value_ = 0.0;
+    data.grad_.setZero();
+    data.hess_.setZero();
+}
+
+void resetResidualData(StageFunctionData &data)
+{
+    data.value_.setZero();
+    data.jac_buffer_.setZero();
+    data.vhp_buffer_.setZero();
+}
+
+void addQuadraticResidual(CostDataAbstract &data,
+                          const Eigen::Ref<const Eigen::VectorXd> &residual,
+                          const Eigen::Ref<const Eigen::MatrixXd> &Jx,
+                          const Eigen::Ref<const Eigen::MatrixXd> &Ju,
+                          const Eigen::Ref<const Eigen::MatrixXd> &weight)
+{
+    const Eigen::VectorXd weightedResidual = weight * residual;
+    data.value_ += 0.5 * residual.dot(weightedResidual);
+    data.Lx_.noalias() += Jx.transpose() * weightedResidual;
+    data.Lu_.noalias() += Ju.transpose() * weightedResidual;
+
+    const Eigen::MatrixXd weightedJx = weight * Jx;
+    const Eigen::MatrixXd weightedJu = weight * Ju;
+    data.Lxx_.noalias() += Jx.transpose() * weightedJx;
+    data.Lxu_.noalias() += Jx.transpose() * weightedJu;
+    data.Lux_.noalias() += Ju.transpose() * weightedJx;
+    data.Luu_.noalias() += Ju.transpose() * weightedJu;
+}
+
+void addStateResidual(CostDataAbstract &data,
+                      const Eigen::Ref<const Eigen::VectorXd> &residual,
+                      const Eigen::Ref<const Eigen::MatrixXd> &Jx,
+                      const Eigen::Ref<const Eigen::MatrixXd> &weight)
+{
+    const Eigen::VectorXd weightedResidual = weight * residual;
+    data.value_ += 0.5 * residual.dot(weightedResidual);
+    data.Lx_.noalias() += Jx.transpose() * weightedResidual;
+    const Eigen::MatrixXd weightedJx = weight * Jx;
+    data.Lxx_.noalias() += Jx.transpose() * weightedJx;
+}
+
+void addControlResidual(CostDataAbstract &data,
+                        const Eigen::Ref<const Eigen::VectorXd> &residual,
+                        const Eigen::Ref<const Eigen::MatrixXd> &weight)
+{
+    const Eigen::VectorXd weightedResidual = weight * residual;
+    data.value_ += 0.5 * residual.dot(weightedResidual);
+    data.Lu_.noalias() += weightedResidual;
+    data.Luu_.noalias() += weight;
+}
+
+struct DirectKinoRunningCostData final : CostDataAbstract
+{
+    DirectKinoRunningCostData(int ndx,
+                              int nu,
+                              const CentroidalMomentumResidual &centroidalResidual,
+                              const CentroidalMomentumDerivativeResidual &centroidalDerivativeResidual,
+                              const std::array<FramePlacementResidual, G1KinodynamicsNmpc::kNumFeet> &footPoseResiduals)
+        : CostDataAbstract(ndx, nu),
+          stateResidual(ndx),
+          stateJacobian(ndx, ndx),
+          controlResidual(nu),
+          centroidalData(centroidalResidual.createData()),
+          centroidalDerivativeData(centroidalDerivativeResidual.createData())
+    {
+        stateResidual.setZero();
+        stateJacobian.setZero();
+        controlResidual.setZero();
+        for (int foot = 0; foot < G1KinodynamicsNmpc::kNumFeet; ++foot)
+        {
+            footPoseData[foot] = footPoseResiduals[foot].createData();
+        }
+    }
+
+    Eigen::VectorXd stateResidual;
+    Eigen::MatrixXd stateJacobian;
+    Eigen::VectorXd controlResidual;
+    std::shared_ptr<StageFunctionData> centroidalData;
+    std::shared_ptr<StageFunctionData> centroidalDerivativeData;
+    std::array<std::shared_ptr<StageFunctionData>, G1KinodynamicsNmpc::kNumFeet> footPoseData;
+};
+
+class DirectKinoRunningCost final : public CostAbstract
+{
+public:
+    DirectKinoRunningCost(const Space &space,
+                          int nu,
+                          std::shared_ptr<DirectKinoCostReferences> references,
+                          const pinocchio::Model &model,
+                          const Eigen::Vector3d &gravity,
+                          const std::vector<bool> &contactStates,
+                          const std::vector<pinocchio::FrameIndex> &contactIds,
+                          const std::array<pinocchio::FrameIndex, G1KinodynamicsNmpc::kNumFeet> &footFrameIds)
+        : CostAbstract(space, nu),
+          references_(std::move(references)),
+          centroidalResidual_(space.ndx(), nu, model, Vector6d::Zero()),
+          centroidalDerivativeResidual_(space.ndx(), model, gravity, contactStates, contactIds, G1KinodynamicsNmpc::kForceSize),
+          footPoseResiduals_{{
+              FramePlacementResidual(space.ndx(), nu, model, pinocchio::SE3::Identity(), footFrameIds[0]),
+              FramePlacementResidual(space.ndx(), nu, model, pinocchio::SE3::Identity(), footFrameIds[1]),
+          }}
+    {
+        if (!references_)
+        {
+            throw std::invalid_argument("DirectKinoRunningCost requires references");
+        }
+    }
+
+    void evaluate(const ConstVectorRef &x, const ConstVectorRef &u, CostData &data) const override
+    {
+        evaluatePack(x, u, data);
+    }
+
+    void computeGradients(const ConstVectorRef &x, const ConstVectorRef &u, CostData &data) const override
+    {
+        evaluatePack(x, u, data);
+    }
+
+    void computeHessians(const ConstVectorRef &, const ConstVectorRef &, CostData &) const override {}
+
+    std::shared_ptr<CostData> createData() const override
+    {
+        return std::make_shared<DirectKinoRunningCostData>(
+            ndx(), nu, centroidalResidual_, centroidalDerivativeResidual_, footPoseResiduals_);
+    }
+
+private:
+    void evaluatePack(const ConstVectorRef &x, const ConstVectorRef &u, CostData &rawData) const
+    {
+        auto &data = static_cast<DirectKinoRunningCostData &>(rawData);
+        resetCostData(data);
+
+        this->space->difference(references_->xRef, x, data.stateResidual);
+        this->space->Jdifference(references_->xRef, x, data.stateJacobian, 1);
+        addStateResidual(data, data.stateResidual, data.stateJacobian, references_->stateWeight);
+
+        data.controlResidual = u - references_->uRef;
+        addControlResidual(data, data.controlResidual, references_->controlWeight);
+
+        resetResidualData(*data.centroidalData);
+        centroidalResidual_.evaluate(x, *data.centroidalData);
+        centroidalResidual_.computeJacobians(x, *data.centroidalData);
+        addQuadraticResidual(data,
+                             data.centroidalData->value_,
+                             data.centroidalData->Jx_,
+                             data.centroidalData->Ju_,
+                             references_->centroidalWeight);
+
+        resetResidualData(*data.centroidalDerivativeData);
+        centroidalDerivativeResidual_.evaluate(x, u, *data.centroidalDerivativeData);
+        centroidalDerivativeResidual_.computeJacobians(x, u, *data.centroidalDerivativeData);
+        addQuadraticResidual(data,
+                             data.centroidalDerivativeData->value_,
+                             data.centroidalDerivativeData->Jx_,
+                             data.centroidalDerivativeData->Ju_,
+                             references_->centroidalDerivativeWeight);
+
+        for (int foot = 0; foot < G1KinodynamicsNmpc::kNumFeet; ++foot)
+        {
+            footPoseResiduals_[foot].setReference(references_->footPoseReference[foot]);
+            resetResidualData(*data.footPoseData[foot]);
+            footPoseResiduals_[foot].evaluate(x, *data.footPoseData[foot]);
+            footPoseResiduals_[foot].computeJacobians(x, *data.footPoseData[foot]);
+            addQuadraticResidual(data,
+                                 data.footPoseData[foot]->value_,
+                                 data.footPoseData[foot]->Jx_,
+                                 data.footPoseData[foot]->Ju_,
+                                 references_->footPoseWeight);
+        }
+    }
+
+    std::shared_ptr<DirectKinoCostReferences> references_;
+    CentroidalMomentumResidual centroidalResidual_;
+    CentroidalMomentumDerivativeResidual centroidalDerivativeResidual_;
+    mutable std::array<FramePlacementResidual, G1KinodynamicsNmpc::kNumFeet> footPoseResiduals_;
+};
+
+struct DirectKinoTerminalCostData final : CostDataAbstract
+{
+    DirectKinoTerminalCostData(int ndx,
+                               int nu,
+                               const CentroidalMomentumResidual &centroidalResidual)
+        : CostDataAbstract(ndx, nu),
+          stateResidual(ndx),
+          stateJacobian(ndx, ndx),
+          centroidalData(centroidalResidual.createData())
+    {
+        stateResidual.setZero();
+        stateJacobian.setZero();
+    }
+
+    Eigen::VectorXd stateResidual;
+    Eigen::MatrixXd stateJacobian;
+    std::shared_ptr<StageFunctionData> centroidalData;
+};
+
+class DirectKinoTerminalCost final : public CostAbstract
+{
+public:
+    DirectKinoTerminalCost(const Space &space,
+                           int nu,
+                           std::shared_ptr<DirectKinoCostReferences> references,
+                           const pinocchio::Model &model)
+        : CostAbstract(space, nu),
+          references_(std::move(references)),
+          centroidalResidual_(space.ndx(), nu, model, Vector6d::Zero())
+    {
+        if (!references_)
+        {
+            throw std::invalid_argument("DirectKinoTerminalCost requires references");
+        }
+    }
+
+    void evaluate(const ConstVectorRef &x, const ConstVectorRef &u, CostData &data) const override
+    {
+        evaluatePack(x, u, data);
+    }
+
+    void computeGradients(const ConstVectorRef &x, const ConstVectorRef &u, CostData &data) const override
+    {
+        evaluatePack(x, u, data);
+    }
+
+    void computeHessians(const ConstVectorRef &, const ConstVectorRef &, CostData &) const override {}
+
+    std::shared_ptr<CostData> createData() const override
+    {
+        return std::make_shared<DirectKinoTerminalCostData>(ndx(), nu, centroidalResidual_);
+    }
+
+private:
+    void evaluatePack(const ConstVectorRef &x, const ConstVectorRef &u, CostData &rawData) const
+    {
+        auto &data = static_cast<DirectKinoTerminalCostData &>(rawData);
+        resetCostData(data);
+
+        this->space->difference(references_->xRef, x, data.stateResidual);
+        this->space->Jdifference(references_->xRef, x, data.stateJacobian, 1);
+        addStateResidual(data, data.stateResidual, data.stateJacobian, references_->terminalWeight);
+
+        resetResidualData(*data.centroidalData);
+        centroidalResidual_.evaluate(x, *data.centroidalData);
+        centroidalResidual_.computeJacobians(x, *data.centroidalData);
+        addQuadraticResidual(data,
+                             data.centroidalData->value_,
+                             data.centroidalData->Jx_,
+                             data.centroidalData->Ju_,
+                             references_->centroidalWeight * 5.0);
+    }
+
+    std::shared_ptr<DirectKinoCostReferences> references_;
+    CentroidalMomentumResidual centroidalResidual_;
 };
 
 Eigen::VectorXd safeVectorOrZero(const Eigen::VectorXd &value, int size)
@@ -191,10 +594,7 @@ struct G1KinodynamicsNmpc::SolverCache
     Signature signature;
     std::unique_ptr<TrajOptProblem> problem;
     std::unique_ptr<SolverProxDDP> solver;
-    std::vector<QuadraticStateCost *> runningStateCosts;
-    std::vector<QuadraticControlCost *> runningControlCosts;
-    std::array<std::vector<FramePlacementResidual *>, kNumFeet> footPoseResiduals;
-    QuadraticStateCost *terminalStateCost{nullptr};
+    std::shared_ptr<DirectKinoCostReferences> references;
 };
 
 G1KinodynamicsNmpc::G1KinodynamicsNmpc(
@@ -294,72 +694,7 @@ void G1KinodynamicsNmpc::shiftWarmStart(const Input &input)
 
 bool G1KinodynamicsNmpc::collectSolverCacheReferences()
 {
-    if (!solverCache_ || !solverCache_->problem)
-    {
-        return false;
-    }
-
-    solverCache_->runningStateCosts.clear();
-    solverCache_->runningControlCosts.clear();
-    for (auto &footResiduals : solverCache_->footPoseResiduals)
-    {
-        footResiduals.clear();
-    }
-    solverCache_->terminalStateCost = nullptr;
-
-    solverCache_->runningStateCosts.reserve(static_cast<std::size_t>(horizon_));
-    solverCache_->runningControlCosts.reserve(static_cast<std::size_t>(horizon_));
-    for (auto &footResiduals : solverCache_->footPoseResiduals)
-    {
-        footResiduals.reserve(static_cast<std::size_t>(horizon_));
-    }
-
-    for (int k = 0; k < horizon_; ++k)
-    {
-        if (k >= static_cast<int>(solverCache_->problem->stages_.size()))
-        {
-            return false;
-        }
-        auto *costStack = solverCache_->problem->stages_[static_cast<std::size_t>(k)]->getCost<CostStack>();
-        if (costStack == nullptr)
-        {
-            return false;
-        }
-
-        auto *stateCost = costStack->getComponent<QuadraticStateCost>("state_cost");
-        auto *controlCost = costStack->getComponent<QuadraticControlCost>("control_cost");
-        if (stateCost == nullptr || controlCost == nullptr)
-        {
-            return false;
-        }
-        solverCache_->runningStateCosts.push_back(stateCost);
-        solverCache_->runningControlCosts.push_back(controlCost);
-
-        for (int foot = 0; foot < kNumFeet; ++foot)
-        {
-            const char *name = (foot == 0) ? "left_foot_pose_cost" : "right_foot_pose_cost";
-            auto *poseCost = costStack->getComponent<QuadraticResidualCost>(name);
-            if (poseCost == nullptr)
-            {
-                return false;
-            }
-            auto *poseResidual = poseCost->getResidual<FramePlacementResidual>();
-            if (poseResidual == nullptr)
-            {
-                return false;
-            }
-            solverCache_->footPoseResiduals[foot].push_back(poseResidual);
-        }
-    }
-
-    auto *terminalCostStack = dynamic_cast<CostStack *>(&*solverCache_->problem->term_cost_);
-    if (terminalCostStack == nullptr)
-    {
-        return false;
-    }
-    solverCache_->terminalStateCost =
-        terminalCostStack->getComponent<QuadraticStateCost>("state_cost");
-    return solverCache_->terminalStateCost != nullptr;
+    return solverCache_ && solverCache_->problem && solverCache_->references;
 }
 
 void G1KinodynamicsNmpc::updateCachedProblemReferences(const Input &input,
@@ -374,24 +709,11 @@ void G1KinodynamicsNmpc::updateCachedProblemReferences(const Input &input,
 
     solverCache_->problem->setInitState(x0);
 
-    for (QuadraticStateCost *cost : solverCache_->runningStateCosts)
-    {
-        cost->setTarget(xRef);
-    }
-    for (QuadraticControlCost *cost : solverCache_->runningControlCosts)
-    {
-        cost->setTarget(uRef);
-    }
+    solverCache_->references->xRef = xRef;
+    solverCache_->references->uRef = uRef;
     for (int foot = 0; foot < kNumFeet; ++foot)
     {
-        for (FramePlacementResidual *residual : solverCache_->footPoseResiduals[foot])
-        {
-            residual->setReference(input.footPoseReference[foot]);
-        }
-    }
-    if (solverCache_->terminalStateCost != nullptr)
-    {
-        solverCache_->terminalStateCost->setTarget(xRef);
+        solverCache_->references->footPoseReference[foot] = input.footPoseReference[foot];
     }
 }
 
@@ -449,6 +771,17 @@ bool G1KinodynamicsNmpc::ensureSolverCache(const Input &input,
     wFrame.diagonal() << 4000.0, 4000.0, 7000.0, 800.0, 800.0, 400.0;
     Eigen::MatrixXd wTerminal = wState * 5.0;
 
+    auto references = std::make_shared<DirectKinoCostReferences>();
+    references->xRef = xRef;
+    references->uRef = uRef;
+    references->footPoseReference = input.footPoseReference;
+    references->stateWeight = wState;
+    references->controlWeight = wControl;
+    references->terminalWeight = wTerminal;
+    references->centroidalWeight = wCent;
+    references->centroidalDerivativeWeight = wCentDer;
+    references->footPoseWeight = wFrame;
+
     std::vector<xyz::polymorphic<StageModel>> stages;
     stages.reserve(static_cast<std::size_t>(horizon_));
     const std::vector<bool> contactStates(input.contactActive.begin(), input.contactActive.end());
@@ -456,35 +789,10 @@ bool G1KinodynamicsNmpc::ensureSolverCache(const Input &input,
 
     for (int k = 0; k < horizon_; ++k)
     {
-        CostStack runningCost(space, nu_);
-        runningCost.addCost("state_cost",
-                            aligator::QuadraticStateCostTpl<double>(space, nu_, xRef, wState));
-        runningCost.addCost("control_cost",
-                            aligator::QuadraticControlCostTpl<double>(space, uRef, wControl));
-        runningCost.addCost("centroidal_cost",
-                            aligator::QuadraticResidualCostTpl<double>(
-                                space,
-                                aligator::CentroidalMomentumResidualTpl<double>(
-                                    space.ndx(), nu_, model_, Vector6d::Zero()),
-                                wCent));
-        runningCost.addCost("centroidal_derivative_cost",
-                            aligator::QuadraticResidualCostTpl<double>(
-                                space,
-                                aligator::CentroidalMomentumDerivativeResidualTpl<double>(
-                                    space.ndx(), model_, gravity_, contactStates, contactIds, kForceSize),
-                                wCentDer));
-        for (int foot = 0; foot < kNumFeet; ++foot)
-        {
-            runningCost.addCost(foot == 0 ? "left_foot_pose_cost" : "right_foot_pose_cost",
-                                aligator::QuadraticResidualCostTpl<double>(
-                                    space,
-                                    aligator::FramePlacementResidualTpl<double>(
-                                        space.ndx(), nu_, model_, input.footPoseReference[foot], footFrameIds_[foot]),
-                                    wFrame));
-        }
-
-        const KinodynamicsFwdDynamics ode(space, model_, gravity_, contactStates, contactIds, kForceSize);
-        const IntegratorSemiImplEuler dynamics(ode, dt_);
+        const DirectKinoRunningCost runningCost(
+            space, nu_, references, model_, gravity_, contactStates, contactIds, footFrameIds_);
+        const DirectSemiImplicitKinodynamics dynamics(
+            space, model_, gravity_, contactStates, contactIds, kForceSize, dt_);
         StageModel stage(runningCost, dynamics);
 
         for (int foot = 0; foot < kNumFeet; ++foot)
@@ -532,22 +840,15 @@ bool G1KinodynamicsNmpc::ensureSolverCache(const Input &input,
         stages.emplace_back(stage);
     }
 
-    CostStack terminalCost(space, nu_);
-    terminalCost.addCost("state_cost",
-                         aligator::QuadraticStateCostTpl<double>(space, nu_, xRef, wTerminal));
-    terminalCost.addCost("centroidal_cost",
-                         aligator::QuadraticResidualCostTpl<double>(
-                             space,
-                             aligator::CentroidalMomentumResidualTpl<double>(
-                                 space.ndx(), nu_, model_, Vector6d::Zero()),
-                             wCent * 5.0));
+    const DirectKinoTerminalCost terminalCost(space, nu_, references, model_);
 
     cache->problem = std::make_unique<TrajOptProblem>(x0, stages, terminalCost);
     cache->problem->setInitState(x0);
+    cache->references = references;
     cache->solver = std::make_unique<SolverProxDDP>(
         tolerance, muInit, static_cast<std::size_t>(std::max(1, maxIterations)),
         aligator::QUIET);
-    cache->solver->rollout_type_ = aligator::RolloutType::LINEAR;
+    cache->solver->rollout_type_ = aligator::RolloutType::NONLINEAR;
     cache->solver->linear_solver_choice = aligator::LQSolverChoice::SERIAL;
     cache->solver->force_initial_condition_ = true;
     cache->solver->max_al_iters = std::max(1, maxAlIterations);
