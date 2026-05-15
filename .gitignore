@@ -182,3 +182,5 @@ build/
 record/datalog.log
 
 .vscode/
+
+wb_humanoid_mpc_ws/
