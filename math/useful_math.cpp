@@ -8,6 +8,9 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 #include "useful_math.h"
 #include "Eigen/Dense"
 
+#include <cmath>
+#include <limits>
+
 using namespace Eigen;
 
 // SVD based pseudo-inverse
@@ -50,7 +53,7 @@ Eigen::MatrixXd pseudoInv_right(const Eigen::MatrixXd &M)
 
 Eigen::MatrixXd pseudoInv_right_weighted(const Eigen::MatrixXd &M, const Eigen::DiagonalMatrix<double, -1> &W)
 {
-    double damp = 0;
+    double damp = 1e-6;
     Eigen::MatrixXd Mres;
     Mres = M * W.inverse() * M.transpose();
     //    Mres=W.inverse()*M.transpose()* pseudoInv_SVD(Mres);
@@ -70,7 +73,7 @@ Eigen::MatrixXd pseudoInv_right_weighted(const Eigen::MatrixXd &M, const Eigen::
 
 Eigen::MatrixXd dyn_pseudoInv(const Eigen::MatrixXd &M, const Eigen::MatrixXd &dyn_M, bool isMinv)
 {
-    double damp = 0;
+    double damp = 1e-6;
     Eigen::MatrixXd Minv;
 
     if (isMinv)
@@ -244,6 +247,25 @@ Eigen::Matrix<double, 3, 3> CrossProduct_A(Eigen::Matrix<double, 3, 1> A)
         A[2], 0.0, -A[0],
         -A[1], A[0], 0.0;
     return M;
+}
+
+Eigen::Matrix3d skewSymmetric(const Eigen::Vector3d &v)
+{
+    Eigen::Matrix3d m;
+    m << 0.0, -v.z(), v.y(),
+        v.z(), 0.0, -v.x(),
+        -v.y(), v.x(), 0.0;
+    return m;
+}
+
+double wrapToPi(double angle)
+{
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+double vectorValueOrDefault(const Eigen::VectorXd &values, int index, double fallback)
+{
+    return (index >= 0 && index < values.size()) ? values(index) : fallback;
 }
 
 double Ramp(double u, double tgt, double inc)

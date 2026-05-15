@@ -7,13 +7,298 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 */
 #include "pino_kin_dyn.h"
 
+#include "useful_math.h"
+
+#include <cmath>
 #include <utility>
+
+namespace g1_kin_dyn
+{
+Eigen::Matrix3d yawRotationFromRotation(const Eigen::Matrix3d &rot_W)
+{
+    return Rz3(std::atan2(rot_W(1, 0), rot_W(0, 0)));
+}
+
+Eigen::MatrixXd pointJacobianLocal(const Eigen::MatrixXd &J6,
+                                   const Eigen::Matrix3d &frameRot_W,
+                                   const Eigen::Vector3d &pointInFrame)
+{
+    const Eigen::Vector3d pointOffset_W = frameRot_W * pointInFrame;
+    const Eigen::MatrixXd Jp_W = J6.topRows(3) - skewSymmetric(pointOffset_W) * J6.bottomRows(3);
+    return yawRotationFromRotation(frameRot_W).transpose() * Jp_W;
+}
+
+Eigen::Vector3d pointDjdqLocal(const Eigen::MatrixXd &J6,
+                               const Eigen::MatrixXd &dJ6,
+                               const Eigen::Matrix3d &frameRot_W,
+                               const Eigen::Vector3d &pointInFrame,
+                               const Eigen::VectorXd &dq)
+{
+    const Eigen::Vector3d pointOffset_W = frameRot_W * pointInFrame;
+    const Eigen::Vector3d omega_W = J6.bottomRows(3) * dq;
+    const Eigen::Vector3d pointOffsetDot_W = omega_W.cross(pointOffset_W);
+    const Eigen::Vector3d dJpDq_W =
+        dJ6.topRows(3) * dq -
+        skewSymmetric(pointOffsetDot_W) * (J6.bottomRows(3) * dq) -
+        skewSymmetric(pointOffset_W) * (dJ6.bottomRows(3) * dq);
+    return yawRotationFromRotation(frameRot_W).transpose() * dJpDq_W;
+}
+
+Kin1D frameYawKinematics(const Eigen::Matrix3d &rot_W,
+                         const Eigen::MatrixXd &J6,
+                         const Eigen::MatrixXd &dJ6,
+                         const Eigen::VectorXd &dq)
+{
+    Kin1D out;
+    out.position = std::atan2(rot_W(1, 0), rot_W(0, 0));
+    out.velocity = (J6.row(5) * dq)(0);
+    out.dJdq = (dJ6.row(5) * dq)(0);
+    out.jacobian = J6.row(5);
+    return out;
+}
+
+Kin1D footDeltaPitchKinematics(const Eigen::MatrixXd &J6,
+                               const Eigen::MatrixXd &dJ6,
+                               const Eigen::Matrix3d &footRot_W,
+                               const Eigen::VectorXd &dq)
+{
+    Kin1D out;
+    const Eigen::MatrixXd J_lf = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_rf = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_lb = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_rb = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0));
+    const Eigen::Vector3d dJdq_lf = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_rf = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_lb = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_rb = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d p_lf = footRot_W * Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_rf = footRot_W * Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_lb = footRot_W * Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_rb = footRot_W * Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0);
+    const double length = kFootContactFrontX - kFootContactBackX;
+    out.jacobian = ((J_lb.row(2) + J_rb.row(2)) * 0.5 - (J_lf.row(2) + J_rf.row(2)) * 0.5) / length;
+    out.position = ((p_lb.z() + p_rb.z()) * 0.5 - (p_lf.z() + p_rf.z()) * 0.5) / length;
+    out.velocity = (out.jacobian * dq)(0);
+    out.dJdq = (((dJdq_lb.z() + dJdq_rb.z()) * 0.5 - (dJdq_lf.z() + dJdq_rf.z()) * 0.5) / length);
+    return out;
+}
+
+Kin1D footDeltaRollKinematics(const Eigen::MatrixXd &J6,
+                              const Eigen::MatrixXd &dJ6,
+                              const Eigen::Matrix3d &footRot_W,
+                              const Eigen::VectorXd &dq)
+{
+    Kin1D out;
+    const Eigen::MatrixXd J_lf = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_rf = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_lb = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0));
+    const Eigen::MatrixXd J_rb = pointJacobianLocal(J6, footRot_W, Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0));
+    const Eigen::Vector3d dJdq_lf = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_rf = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_lb = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d dJdq_rb = pointDjdqLocal(J6, dJ6, footRot_W, Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0), dq);
+    const Eigen::Vector3d p_lf = footRot_W * Eigen::Vector3d(kFootContactFrontX, kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_rf = footRot_W * Eigen::Vector3d(kFootContactFrontX, -kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_lb = footRot_W * Eigen::Vector3d(kFootContactBackX, kFootContactHalfWidth, 0.0);
+    const Eigen::Vector3d p_rb = footRot_W * Eigen::Vector3d(kFootContactBackX, -kFootContactHalfWidth, 0.0);
+    const double width = 2.0 * kFootContactHalfWidth;
+    out.jacobian = ((J_lf.row(2) + J_lb.row(2)) * 0.5 - (J_rf.row(2) + J_rb.row(2)) * 0.5) / width;
+    out.position = ((p_lf.z() + p_lb.z()) * 0.5 - (p_rf.z() + p_rb.z()) * 0.5) / width;
+    out.velocity = (out.jacobian * dq)(0);
+    out.dJdq = (((dJdq_lf.z() + dJdq_lb.z()) * 0.5 - (dJdq_rf.z() + dJdq_rb.z()) * 0.5) / width);
+    return out;
+}
+
+Kin1D baseDeltaPitchKinematics(const Eigen::MatrixXd &Jbase,
+                               const Eigen::MatrixXd &dJbase,
+                               const Eigen::Matrix3d &baseRot_W,
+                               const Eigen::VectorXd &dq)
+{
+    Kin1D out;
+    const Eigen::MatrixXd J_f = pointJacobianLocal(Jbase, baseRot_W, Eigen::Vector3d(kBaseFrontX, 0.0, 0.0));
+    const Eigen::MatrixXd J_b = pointJacobianLocal(Jbase, baseRot_W, Eigen::Vector3d(kBaseBackX, 0.0, 0.0));
+    const Eigen::Vector3d dJdq_f = pointDjdqLocal(Jbase, dJbase, baseRot_W, Eigen::Vector3d(kBaseFrontX, 0.0, 0.0), dq);
+    const Eigen::Vector3d dJdq_b = pointDjdqLocal(Jbase, dJbase, baseRot_W, Eigen::Vector3d(kBaseBackX, 0.0, 0.0), dq);
+    const Eigen::Vector3d p_f = baseRot_W * Eigen::Vector3d(kBaseFrontX, 0.0, 0.0);
+    const Eigen::Vector3d p_b = baseRot_W * Eigen::Vector3d(kBaseBackX, 0.0, 0.0);
+    out.jacobian = (J_b.row(2) - J_f.row(2)) / (kBaseFrontX - kBaseBackX);
+    out.position = (p_b.z() - p_f.z()) / (kBaseFrontX - kBaseBackX);
+    out.velocity = (out.jacobian * dq)(0);
+    out.dJdq = (dJdq_b.z() - dJdq_f.z()) / (kBaseFrontX - kBaseBackX);
+    return out;
+}
+
+Kin1D baseDeltaRollKinematics(const Eigen::MatrixXd &Jbase,
+                              const Eigen::MatrixXd &dJbase,
+                              const Eigen::Matrix3d &baseRot_W,
+                              const Eigen::VectorXd &dq)
+{
+    Kin1D out;
+    const Eigen::MatrixXd J_l = pointJacobianLocal(Jbase, baseRot_W, Eigen::Vector3d(0.0, kBaseLeftY, 0.0));
+    const Eigen::MatrixXd J_r = pointJacobianLocal(Jbase, baseRot_W, Eigen::Vector3d(0.0, kBaseRightY, 0.0));
+    const Eigen::Vector3d dJdq_l = pointDjdqLocal(Jbase, dJbase, baseRot_W, Eigen::Vector3d(0.0, kBaseLeftY, 0.0), dq);
+    const Eigen::Vector3d dJdq_r = pointDjdqLocal(Jbase, dJbase, baseRot_W, Eigen::Vector3d(0.0, kBaseRightY, 0.0), dq);
+    const Eigen::Vector3d p_l = baseRot_W * Eigen::Vector3d(0.0, kBaseLeftY, 0.0);
+    const Eigen::Vector3d p_r = baseRot_W * Eigen::Vector3d(0.0, kBaseRightY, 0.0);
+    out.jacobian = (J_l.row(2) - J_r.row(2)) / (kBaseLeftY - kBaseRightY);
+    out.position = (p_l.z() - p_r.z()) / (kBaseLeftY - kBaseRightY);
+    out.velocity = (out.jacobian * dq)(0);
+    out.dJdq = (dJdq_l.z() - dJdq_r.z()) / (kBaseLeftY - kBaseRightY);
+    return out;
+}
+
+Eigen::Matrix<double, 6, 6> planeForceToWrenchMap()
+{
+    Eigen::Matrix<double, 6, 6> H;
+    H << 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 1.0, 1.0,
+        0.0, 0.0, kFootContactHalfWidth, 0.0, -kFootContactHalfWidth, 0.0,
+        0.0, 0.0, -kFootContactFrontX, 0.0, -kFootContactFrontX, -kFootContactBackX,
+        -kFootContactHalfWidth, kFootContactFrontX, 0.0, kFootContactHalfWidth, 0.0, 0.0;
+    return H;
+}
+
+Eigen::Matrix<double, 6, 1> distributeVerticalFootLoad(double fz)
+{
+    Eigen::Matrix<double, 6, 1> f;
+    const double frontTotal = -kFootContactBackX / (kFootContactFrontX - kFootContactBackX) * fz;
+    const double back = fz - frontTotal;
+    f << 0.0, 0.0, 0.5 * frontTotal, 0.0, 0.5 * frontTotal, back;
+    return f;
+}
+
+Eigen::Matrix<double, 11, 6> roMoCoPlaneFootCone(double mu,
+                                                 double footHalfWidth,
+                                                 double footFront,
+                                                 double footBack,
+                                                 double yawFriction)
+{
+    Eigen::Matrix<double, 11, 6> coneRaw;
+    coneRaw << 0, 0, -1, 0, 0, 0,
+        1, 0, -mu / std::sqrt(2.0), 0, 0, 0,
+        -1, 0, -mu / std::sqrt(2.0), 0, 0, 0,
+        0, 1, -mu / std::sqrt(2.0), 0, 0, 0,
+        0, -1, -mu / std::sqrt(2.0), 0, 0, 0,
+        0, 0, -footHalfWidth, 1, 0, 0,
+        0, 0, -footHalfWidth, -1, 0, 0,
+        0, 0, -footFront, 0, 1, 0,
+        0, 0, footBack, 0, -1, 0,
+        0, 0, -yawFriction, 0, 0, 1,
+        0, 0, -yawFriction, 0, 0, -1;
+    return coneRaw * planeForceToWrenchMap();
+}
+
+double motorTorqueLimit(int motorId)
+{
+    static const double limits[] = {
+        88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
+        88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
+        88.0, 50.0, 50.0,
+        25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,
+        25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0};
+    constexpr int nLimits = sizeof(limits) / sizeof(limits[0]);
+    if (motorId >= 0 && motorId < nLimits)
+    {
+        return limits[motorId];
+    }
+    return 50.0;
+}
+} // namespace g1_kin_dyn
+
+namespace
+{
+Eigen::Matrix3d ParallelAxisShift(double mass, const Eigen::Vector3d &r)
+{
+    return mass * (r.squaredNorm() * Eigen::Matrix3d::Identity() - r * r.transpose());
+}
+
+void AddG1FootFrames(pinocchio::Model &model)
+{
+    const auto left_ankle_id = model.getJointId("left_ankle_roll_joint");
+    const auto right_ankle_id = model.getJointId("right_ankle_roll_joint");
+
+    auto addFrameIfMissing = [&](const std::string &name,
+                                 const pinocchio::JointIndex jointId,
+                                 const Eigen::Vector3d &offset)
+    {
+        if (!model.existFrame(name))
+        {
+            model.addFrame(pinocchio::Frame(name, jointId, 0,
+                                            pinocchio::SE3(Eigen::Matrix3d::Identity(), offset),
+                                            pinocchio::OP_FRAME));
+        }
+    };
+
+    addFrameIfMissing("left_foot_LF", left_ankle_id, Eigen::Vector3d(0.12, 0.025, -0.03));
+    addFrameIfMissing("left_foot_RF", left_ankle_id, Eigen::Vector3d(0.12, -0.025, -0.03));
+    addFrameIfMissing("left_foot_LB", left_ankle_id, Eigen::Vector3d(-0.05, 0.025, -0.03));
+    addFrameIfMissing("left_foot_RB", left_ankle_id, Eigen::Vector3d(-0.05, -0.025, -0.03));
+    addFrameIfMissing("right_foot_LF", right_ankle_id, Eigen::Vector3d(0.12, 0.025, -0.03));
+    addFrameIfMissing("right_foot_RF", right_ankle_id, Eigen::Vector3d(0.12, -0.025, -0.03));
+    addFrameIfMissing("right_foot_LB", right_ankle_id, Eigen::Vector3d(-0.05, 0.025, -0.03));
+    addFrameIfMissing("right_foot_RB", right_ankle_id, Eigen::Vector3d(-0.05, -0.025, -0.03));
+    addFrameIfMissing("left_below_ankle", left_ankle_id, Eigen::Vector3d(0.0, 0.0, -0.03));
+    addFrameIfMissing("right_below_ankle", right_ankle_id, Eigen::Vector3d(0.0, 0.0, -0.03));
+}
+
+Eigen::Matrix3d YawRotationFromFrame(const pinocchio::SE3 &framePose)
+{
+    const Eigen::Matrix3d &rot = framePose.rotation();
+    return Rz3(std::atan2(rot(1, 0), rot(0, 0)));
+}
+
+void BuildRoMoCoFootConstraint(const pinocchio::Model &model,
+                               pinocchio::Data &data,
+                               pinocchio::FrameIndex belowAnkleFrame,
+                               pinocchio::FrameIndex lfFrame,
+                               pinocchio::FrameIndex rfFrame,
+                               pinocchio::FrameIndex lbFrame,
+                               pinocchio::FrameIndex rbFrame,
+                               Eigen::MatrixXd &Jh,
+                               Eigen::VectorXd &dJhdq)
+{
+    const Eigen::Matrix3d RyawT = YawRotationFromFrame(data.oMf[belowAnkleFrame]).transpose();
+    Eigen::MatrixXd Jlf = Eigen::MatrixXd::Zero(6, model.nv);
+    Eigen::MatrixXd Jrf = Eigen::MatrixXd::Zero(6, model.nv);
+    Eigen::MatrixXd Jlb = Eigen::MatrixXd::Zero(6, model.nv);
+    Eigen::MatrixXd Jrb = Eigen::MatrixXd::Zero(6, model.nv);
+    pinocchio::getFrameJacobian(model, data, lfFrame, pinocchio::LOCAL_WORLD_ALIGNED, Jlf);
+    pinocchio::getFrameJacobian(model, data, rfFrame, pinocchio::LOCAL_WORLD_ALIGNED, Jrf);
+    pinocchio::getFrameJacobian(model, data, lbFrame, pinocchio::LOCAL_WORLD_ALIGNED, Jlb);
+    pinocchio::getFrameJacobian(model, data, rbFrame, pinocchio::LOCAL_WORLD_ALIGNED, Jrb);
+
+    const Eigen::Vector3d alf = RyawT * pinocchio::getFrameClassicalAcceleration(model, data, lfFrame, pinocchio::LOCAL_WORLD_ALIGNED).linear();
+    const Eigen::Vector3d arf = RyawT * pinocchio::getFrameClassicalAcceleration(model, data, rfFrame, pinocchio::LOCAL_WORLD_ALIGNED).linear();
+    const Eigen::Vector3d alb = RyawT * pinocchio::getFrameClassicalAcceleration(model, data, lbFrame, pinocchio::LOCAL_WORLD_ALIGNED).linear();
+    const Eigen::Vector3d arb = RyawT * pinocchio::getFrameClassicalAcceleration(model, data, rbFrame, pinocchio::LOCAL_WORLD_ALIGNED).linear();
+
+    Jlf.topRows(3) = RyawT * Jlf.topRows(3);
+    Jrf.topRows(3) = RyawT * Jrf.topRows(3);
+    Jlb.topRows(3) = RyawT * Jlb.topRows(3);
+    Jrb.topRows(3) = RyawT * Jrb.topRows(3);
+
+    Jh.resize(6, model.nv);
+    Jh.topRows(3) = Jlf.topRows(3);
+    Jh.row(3) = Jrf.row(0);
+    Jh.row(4) = Jrf.row(2);
+    Jh.row(5) = 0.5 * (Jlb.row(2) + Jrb.row(2));
+
+    dJhdq.resize(6);
+    dJhdq.head<3>() = alf;
+    dJhdq(3) = arf.x();
+    dJhdq(4) = arf.z();
+    dJhdq(5) = 0.5 * (alb.z() + arb.z());
+}
+} // namespace
 
 Pin_KinDyn::Pin_KinDyn(std::string urdf_pathIn)
 {
     pinocchio::JointModelFreeFlyer root_joint;
     pinocchio::urdf::buildModel(urdf_pathIn, root_joint, model_biped);
     pinocchio::urdf::buildModel(urdf_pathIn, model_biped_fixed);
+    AddG1FootFrames(model_biped);
+    AddG1FootFrames(model_biped_fixed);
     data_biped = pinocchio::Data(model_biped);
     data_biped_fixed = pinocchio::Data(model_biped_fixed);
     model_nv = model_biped.nv;
@@ -25,8 +310,12 @@ Pin_KinDyn::Pin_KinDyn(std::string urdf_pathIn)
     J_hd_r = Eigen::MatrixXd::Zero(6, model_nv);
     J_base = Eigen::MatrixXd::Zero(6, model_nv);
     J_hip_link = Eigen::MatrixXd::Zero(6, model_nv);
+    J_l_foot = Eigen::MatrixXd::Zero(6, model_nv);
+    J_r_foot = Eigen::MatrixXd::Zero(6, model_nv);
     dJ_l = Eigen::MatrixXd::Zero(6, model_nv);
     dJ_r = Eigen::MatrixXd::Zero(6, model_nv);
+    dJ_l_foot = Eigen::VectorXd::Zero(6);
+    dJ_r_foot = Eigen::VectorXd::Zero(6);
     dJ_hd_l = Eigen::MatrixXd::Zero(6, model_nv);
     dJ_hd_r = Eigen::MatrixXd::Zero(6, model_nv);
     dJ_base = Eigen::MatrixXd::Zero(6, model_nv);
@@ -39,28 +328,44 @@ Pin_KinDyn::Pin_KinDyn(std::string urdf_pathIn)
     dyn_C = Eigen::MatrixXd::Zero(model_nv, model_nv);
     dyn_G = Eigen::MatrixXd::Zero(model_nv, 1);
 
-    // get joint index for Pinocchio Lib, need to redefined the joint name for new model
-    r_ankle_joint = model_biped.getJointId("J_ankle_r_roll");
-    l_ankle_joint = model_biped.getJointId("J_ankle_l_roll");
-    r_hand_joint = model_biped.getJointId("J_arm_r_07");
-    l_hand_joint = model_biped.getJointId("J_arm_l_07");
-    r_hand_joint_fixed = model_biped_fixed.getJointId("J_arm_r_07");
-    l_hand_joint_fixed = model_biped_fixed.getJointId("J_arm_l_07");
-    r_hip_joint = model_biped.getJointId("J_hip_r_yaw");
-    l_hip_joint = model_biped.getJointId("J_hip_l_yaw");
-    r_hip_roll_joint = model_biped.getJointId("J_hip_r_roll");
-    l_hip_roll_joint = model_biped.getJointId("J_hip_l_roll");
-    r_ankle_joint_fixed = model_biped_fixed.getJointId("J_ankle_r_roll");
-    l_ankle_joint_fixed = model_biped_fixed.getJointId("J_ankle_l_roll");
-    r_hip_joint_fixed = model_biped_fixed.getJointId("J_hip_r_yaw");
-    l_hip_joint_fixed = model_biped_fixed.getJointId("J_hip_l_yaw");
+    // G1 joint and frame ids.
+    r_ankle_joint = model_biped.getJointId("right_ankle_roll_joint");
+    l_ankle_joint = model_biped.getJointId("left_ankle_roll_joint");
+    r_foot_frame = model_biped.getFrameId("right_below_ankle");
+    l_foot_frame = model_biped.getFrameId("left_below_ankle");
+    l_foot_lf_frame = model_biped.getFrameId("left_foot_LF");
+    l_foot_rf_frame = model_biped.getFrameId("left_foot_RF");
+    l_foot_lb_frame = model_biped.getFrameId("left_foot_LB");
+    l_foot_rb_frame = model_biped.getFrameId("left_foot_RB");
+    r_foot_lf_frame = model_biped.getFrameId("right_foot_LF");
+    r_foot_rf_frame = model_biped.getFrameId("right_foot_RF");
+    r_foot_lb_frame = model_biped.getFrameId("right_foot_LB");
+    r_foot_rb_frame = model_biped.getFrameId("right_foot_RB");
+    r_hand_joint = model_biped.getJointId("right_wrist_yaw_joint");
+    l_hand_joint = model_biped.getJointId("left_wrist_yaw_joint");
+    r_hand_joint_fixed = model_biped_fixed.getJointId("right_wrist_yaw_joint");
+    l_hand_joint_fixed = model_biped_fixed.getJointId("left_wrist_yaw_joint");
+    r_hip_joint = model_biped.getJointId("right_hip_yaw_joint");
+    l_hip_joint = model_biped.getJointId("left_hip_yaw_joint");
+    r_hip_roll_joint = model_biped.getJointId("right_hip_roll_joint");
+    l_hip_roll_joint = model_biped.getJointId("left_hip_roll_joint");
+    r_ankle_joint_fixed = model_biped_fixed.getJointId("right_ankle_roll_joint");
+    l_ankle_joint_fixed = model_biped_fixed.getJointId("left_ankle_roll_joint");
+    r_foot_frame_fixed = model_biped_fixed.getFrameId("right_below_ankle");
+    l_foot_frame_fixed = model_biped_fixed.getFrameId("left_below_ankle");
+    r_hip_joint_fixed = model_biped_fixed.getJointId("right_hip_yaw_joint");
+    l_hip_joint_fixed = model_biped_fixed.getJointId("left_hip_yaw_joint");
     base_joint = model_biped.getJointId("root_joint");
-    waist_yaw_joint = model_biped.getJointId("J_waist_yaw");
+    waist_yaw_joint = model_biped.getJointId("waist_yaw_joint");
 
     // read joint pvt parameters
     Json::Reader reader;
     Json::Value root_read;
-    std::ifstream in("joint_ctrl_config.json", std::ios::binary);
+    std::ifstream in("../common/joint_ctrl_config.json", std::ios::binary);
+    if (!in.is_open())
+    {
+        in.open("common/joint_ctrl_config.json", std::ios::binary);
+    }
 
     motorMaxTorque = Eigen::VectorXd::Zero(motorName.size());
     motorMaxPos = Eigen::VectorXd::Zero(motorName.size());
@@ -97,6 +402,10 @@ void Pin_KinDyn::dataBusWrite(DataBus &robotState)
     robotState.J_base = J_base;
     robotState.dJ_l = dJ_l;
     robotState.dJ_r = dJ_r;
+    robotState.J_l_foot = J_l_foot;
+    robotState.J_r_foot = J_r_foot;
+    robotState.dJ_l_foot = dJ_l_foot;
+    robotState.dJ_r_foot = dJ_r_foot;
     robotState.J_hd_l = J_hd_l;
     robotState.J_hd_r = J_hd_r;
     robotState.dJ_hd_l = dJ_hd_l;
@@ -138,6 +447,7 @@ void Pin_KinDyn::dataBusWrite(DataBus &robotState)
 
     robotState.pCoM_W = CoM_pos;
     robotState.Jcom_W = Jcom;
+    robotState.dJcom_W = dJcom;
 
     robotState.inertia = inertia; // w.r.t body frame
 }
@@ -145,13 +455,21 @@ void Pin_KinDyn::dataBusWrite(DataBus &robotState)
 // update jacobians and joint positions
 void Pin_KinDyn::computeJ_dJ()
 {
-    pinocchio::forwardKinematics(model_biped, data_biped, q);
+    pinocchio::forwardKinematics(model_biped, data_biped, q, dq, Eigen::VectorXd::Zero(model_nv));
     pinocchio::jacobianCenterOfMass(model_biped, data_biped, q, true);
+    pinocchio::centerOfMass(model_biped, data_biped, pinocchio::KinematicLevel::ACCELERATION, false);
     //    pinocchio::computeJointJacobians(model_biped,data_biped,q);
     pinocchio::computeJointJacobiansTimeVariation(model_biped, data_biped, q, dq);
     pinocchio::updateGlobalPlacements(model_biped, data_biped);
-    pinocchio::getJointJacobian(model_biped, data_biped, r_ankle_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_r);
-    pinocchio::getJointJacobian(model_biped, data_biped, l_ankle_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_l);
+    pinocchio::updateFramePlacements(model_biped, data_biped);
+    pinocchio::getFrameJacobian(model_biped, data_biped, r_foot_frame, pinocchio::LOCAL_WORLD_ALIGNED, J_r);
+    pinocchio::getFrameJacobian(model_biped, data_biped, l_foot_frame, pinocchio::LOCAL_WORLD_ALIGNED, J_l);
+    BuildRoMoCoFootConstraint(model_biped, data_biped, l_foot_frame,
+                              l_foot_lf_frame, l_foot_rf_frame, l_foot_lb_frame, l_foot_rb_frame,
+                              J_l_foot, dJ_l_foot);
+    BuildRoMoCoFootConstraint(model_biped, data_biped, r_foot_frame,
+                              r_foot_lf_frame, r_foot_rf_frame, r_foot_lb_frame, r_foot_rb_frame,
+                              J_r_foot, dJ_r_foot);
     pinocchio::getJointJacobian(model_biped, data_biped, r_hand_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_hd_r);
     pinocchio::getJointJacobian(model_biped, data_biped, l_hand_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_hd_l);
     pinocchio::getJointJacobian(model_biped, data_biped, base_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_base);
@@ -166,16 +484,16 @@ void Pin_KinDyn::computeJ_dJ()
     //    std::cout<<"J_hip_roll_r"<<std::endl<<J_hip_roll_r<<std::endl;
     pinocchio::getJointJacobian(model_biped, data_biped, waist_yaw_joint, pinocchio::LOCAL_WORLD_ALIGNED, J_hip_link);
 
-    pinocchio::getJointJacobianTimeVariation(model_biped, data_biped, r_ankle_joint, pinocchio::LOCAL_WORLD_ALIGNED, dJ_r);
-    pinocchio::getJointJacobianTimeVariation(model_biped, data_biped, l_ankle_joint, pinocchio::LOCAL_WORLD_ALIGNED, dJ_l);
+    pinocchio::getFrameJacobianTimeVariation(model_biped, data_biped, r_foot_frame, pinocchio::LOCAL_WORLD_ALIGNED, dJ_r);
+    pinocchio::getFrameJacobianTimeVariation(model_biped, data_biped, l_foot_frame, pinocchio::LOCAL_WORLD_ALIGNED, dJ_l);
     pinocchio::getJointJacobianTimeVariation(model_biped, data_biped, r_hand_joint, pinocchio::LOCAL_WORLD_ALIGNED, dJ_hd_r);
     pinocchio::getJointJacobianTimeVariation(model_biped, data_biped, l_hand_joint, pinocchio::LOCAL_WORLD_ALIGNED, dJ_hd_l);
     pinocchio::getJointJacobianTimeVariation(model_biped, data_biped, base_joint, pinocchio::LOCAL_WORLD_ALIGNED, dJ_base);
-    fe_l_pos = data_biped.oMi[l_ankle_joint].translation();
-    fe_l_rot = data_biped.oMi[l_ankle_joint].rotation();
+    fe_l_pos = data_biped.oMf[l_foot_frame].translation();
+    fe_l_rot = data_biped.oMf[l_foot_frame].rotation();
     hip_l_pos = data_biped.oMi[l_hip_joint].translation();
-    fe_r_pos = data_biped.oMi[r_ankle_joint].translation();
-    fe_r_rot = data_biped.oMi[r_ankle_joint].rotation();
+    fe_r_pos = data_biped.oMf[r_foot_frame].translation();
+    fe_r_rot = data_biped.oMf[r_foot_frame].rotation();
     hip_r_pos = data_biped.oMi[r_hip_joint].translation();
     base_pos = data_biped.oMi[base_joint].translation();
     base_rot = data_biped.oMi[base_joint].rotation();
@@ -195,6 +513,8 @@ void Pin_KinDyn::computeJ_dJ()
     Mpj.block(3, 3, 3, 3) = base_rot.transpose();
     J_l = J_l * Mpj;
     J_r = J_r * Mpj;
+    J_l_foot = J_l_foot * Mpj;
+    J_r_foot = J_r_foot * Mpj;
     J_base = J_base * Mpj;
     dJ_l = dJ_l * Mpj;
     dJ_r = dJ_r * Mpj;
@@ -205,6 +525,7 @@ void Pin_KinDyn::computeJ_dJ()
     dJ_base = dJ_base * Mpj;
     J_hip_link = J_hip_link * Mpj;
     Jcom = Jcom * Mpj;
+    dJcom = data_biped.acom[0];
 
     Eigen::VectorXd q_fixed, dq_fixed;
     q_fixed = q.block(7, 0, model_biped_fixed.nv, 1);
@@ -212,12 +533,13 @@ void Pin_KinDyn::computeJ_dJ()
     pinocchio::forwardKinematics(model_biped_fixed, data_biped_fixed, q_fixed);
     pinocchio::computeJointJacobians(model_biped_fixed, data_biped_fixed, q_fixed);
     pinocchio::updateGlobalPlacements(model_biped_fixed, data_biped_fixed);
-    pinocchio::getJointJacobian(model_biped_fixed, data_biped_fixed, r_ankle_joint_fixed, pinocchio::LOCAL_WORLD_ALIGNED, J_r_body);
-    pinocchio::getJointJacobian(model_biped_fixed, data_biped_fixed, l_ankle_joint_fixed, pinocchio::LOCAL_WORLD_ALIGNED, J_l_body);
-    fe_l_pos_body = data_biped_fixed.oMi[l_ankle_joint_fixed].translation();
-    fe_r_pos_body = data_biped_fixed.oMi[r_ankle_joint_fixed].translation();
-    fe_l_rot_body = data_biped_fixed.oMi[l_ankle_joint_fixed].rotation();
-    fe_r_rot_body = data_biped_fixed.oMi[r_ankle_joint_fixed].rotation();
+    pinocchio::updateFramePlacements(model_biped_fixed, data_biped_fixed);
+    pinocchio::getFrameJacobian(model_biped_fixed, data_biped_fixed, r_foot_frame_fixed, pinocchio::LOCAL_WORLD_ALIGNED, J_r_body);
+    pinocchio::getFrameJacobian(model_biped_fixed, data_biped_fixed, l_foot_frame_fixed, pinocchio::LOCAL_WORLD_ALIGNED, J_l_body);
+    fe_l_pos_body = data_biped_fixed.oMf[l_foot_frame_fixed].translation();
+    fe_r_pos_body = data_biped_fixed.oMf[r_foot_frame_fixed].translation();
+    fe_l_rot_body = data_biped_fixed.oMf[l_foot_frame_fixed].rotation();
+    fe_r_rot_body = data_biped_fixed.oMf[r_foot_frame_fixed].rotation();
     hip_l_pos_body = data_biped_fixed.oMi[l_hip_joint_fixed].translation();
     hip_r_pos_body = data_biped_fixed.oMi[r_hip_joint_fixed].translation();
     hd_l_pos_body = data_biped_fixed.oMi[l_hand_joint_fixed].translation();
@@ -326,6 +648,69 @@ void Pin_KinDyn::computeDyn()
     dyn_C = Mpj_inv * dyn_C * Mpj;
     dyn_G = Mpj_inv * dyn_G;
     dyn_Non = Mpj_inv * dyn_Non;
+    dyn_Ag = dyn_Ag * Mpj;
+    dyn_dAg = dyn_dAg * Mpj;
+}
+
+Pin_KinDyn::CompositeInertia Pin_KinDyn::computeLowerBodyInertia(const Eigen::Vector3d &referenceComWorld)
+{
+    CompositeInertia out;
+    pinocchio::forwardKinematics(model_biped, data_biped, q);
+    pinocchio::updateGlobalPlacements(model_biped, data_biped);
+
+    static const std::vector<std::string> jointNames = {
+        "root_joint",
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint"};
+
+    struct BodyContribution
+    {
+        double mass{0.0};
+        Eigen::Vector3d comWorld{Eigen::Vector3d::Zero()};
+        Eigen::Matrix3d inertiaAboutBodyComWorld{Eigen::Matrix3d::Zero()};
+    };
+    std::vector<BodyContribution> bodies;
+    bodies.reserve(jointNames.size());
+
+    for (const std::string &name : jointNames)
+    {
+        if (!model_biped.existJointName(name))
+        {
+            continue;
+        }
+        const pinocchio::JointIndex jointId = model_biped.getJointId(name);
+        if (jointId >= model_biped.inertias.size())
+        {
+            continue;
+        }
+        const pinocchio::Inertia &bodyInertia = model_biped.inertias[jointId];
+        const double mass = bodyInertia.mass();
+        if (mass <= 0.0)
+        {
+            continue;
+        }
+
+        const Eigen::Matrix3d &rotWorld = data_biped.oMi[jointId].rotation();
+        const Eigen::Vector3d comWorld = data_biped.oMi[jointId].act(bodyInertia.lever());
+        const Eigen::Matrix3d inertiaWorld = rotWorld * bodyInertia.inertia().matrix() * rotWorld.transpose();
+
+        bodies.push_back({mass, comWorld, inertiaWorld});
+        out.mass += mass;
+    }
+
+    if (out.mass <= 1e-9)
+    {
+        return out;
+    }
+
+    for (const BodyContribution &body : bodies)
+    {
+        out.inertiaAboutReferenceWorld.noalias() +=
+            body.inertiaAboutBodyComWorld + ParallelAxisShift(body.mass, body.comWorld - referenceComWorld);
+    }
+    return out;
 }
 
 // Inverse kinematics for leg posture. Note: the Rdes and Pdes are both w.r.t the baselink coordinate in body frame!
@@ -337,8 +722,15 @@ Pin_KinDyn::computeInK_Leg(const Eigen::Matrix3d &Rdes_L, const Eigen::Vector3d 
     const pinocchio::SE3 oMdesR(Rdes_R, Pdes_R);
     // arm-l: 0-6, arm-r: 7-13, head: 14,15 waist: 16-18, leg-l: 19-24, leg-r: 25-30
     Eigen::VectorXd qIk = Eigen::VectorXd::Zero(model_biped_fixed.nv); // initial guess
-    qIk[22] = -0.1;
-    qIk[28] = -0.1;
+    if (q.size() >= 7 + model_biped_fixed.nv)
+    {
+        qIk = q.segment(7, model_biped_fixed.nv);
+    }
+    else
+    {
+        qIk[22] = -0.1;
+        qIk[28] = -0.1;
+    }
 
     const double eps = 1e-4;
     const int IT_MAX = 100;
@@ -356,15 +748,14 @@ Pin_KinDyn::computeInK_Leg(const Eigen::Matrix3d &Rdes_L, const Eigen::Vector3d 
     Eigen::Matrix<double, 12, 1> errCompact;
     Eigen::VectorXd v(model_biped_fixed.nv);
 
-    pinocchio::JointIndex J_Idx_l, J_Idx_r;
-    J_Idx_l = l_ankle_joint_fixed;
-    J_Idx_r = r_ankle_joint_fixed;
     int itr_count{0};
     for (itr_count = 0;; itr_count++)
     {
         pinocchio::forwardKinematics(model_biped_fixed, data_biped_fixed, qIk);
-        const pinocchio::SE3 iMdL = data_biped_fixed.oMi[J_Idx_l].actInv(oMdesL);
-        const pinocchio::SE3 iMdR = data_biped_fixed.oMi[J_Idx_r].actInv(oMdesR);
+        pinocchio::computeJointJacobians(model_biped_fixed, data_biped_fixed, qIk);
+        pinocchio::updateFramePlacements(model_biped_fixed, data_biped_fixed);
+        const pinocchio::SE3 iMdL = data_biped_fixed.oMf[l_foot_frame_fixed].actInv(oMdesL);
+        const pinocchio::SE3 iMdR = data_biped_fixed.oMf[r_foot_frame_fixed].actInv(oMdesR);
         errL = pinocchio::log6(iMdL).toVector(); // in joint frame
         errR = pinocchio::log6(iMdR).toVector(); // in joint frame
         errCompact.block<6, 1>(0, 0) = errL;
@@ -380,8 +771,8 @@ Pin_KinDyn::computeInK_Leg(const Eigen::Matrix3d &Rdes_L, const Eigen::Vector3d 
             break;
         }
 
-        pinocchio::computeJointJacobian(model_biped_fixed, data_biped_fixed, qIk, J_Idx_l, JL); // JL in joint frame
-        pinocchio::computeJointJacobian(model_biped_fixed, data_biped_fixed, qIk, J_Idx_r, JR); // JR in joint frame
+        pinocchio::getFrameJacobian(model_biped_fixed, data_biped_fixed, l_foot_frame_fixed, pinocchio::LOCAL, JL);
+        pinocchio::getFrameJacobian(model_biped_fixed, data_biped_fixed, r_foot_frame_fixed, pinocchio::LOCAL, JR);
         Eigen::MatrixXd W;
         W = Eigen::MatrixXd::Identity(model_biped_fixed.nv, model_biped_fixed.nv); // weighted matrix
         // arm-l: 0-6, arm-r: 7-13, head: 14,15 waist: 16-18, leg-l: 19-24, leg-r: 25-30

@@ -7,8 +7,11 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 */
 #include <mujoco/mujoco.h>
 #include <GLFW/glfw3.h>
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <limits>
+#include <string>
 #include "useful_math.h"
 #include "GLFW_callbacks.h"
 #include "MJ_interface.h"
@@ -16,27 +19,83 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 #include "pino_kin_dyn.h"
 #include "data_logger.h"
 #include "wbc_priority.h"
+#include "wbc_bruce_weighted.h"
 #include "gait_scheduler.h"
 #include "foot_placement.h"
 #include "joystick_interpreter.h"
 #include "StateEst.h"
 
+namespace
+{
+constexpr int kTotalMotorDof = 29;
+constexpr bool kUseStateEstimatorInMujoco = false;
+constexpr int kLeftAnklePitchMotorId = 4;
+constexpr int kLeftAnkleRollMotorId = 5;
+constexpr int kRightAnklePitchMotorId = 10;
+constexpr int kRightAnkleRollMotorId = 11;
+
+double totalModelMass(const mjModel *model)
+{
+    double mass = 0.0;
+    for (int i = 0; i < model->nbody; ++i)
+    {
+        mass += model->body_mass[i];
+    }
+    return mass;
+}
+
+std::vector<double> makeG1StandPose()
+{
+    std::vector<double> q(kTotalMotorDof, 0.0);
+    q[0] = -0.2;
+    q[3] = 0.4;
+    q[4] = -0.2;
+    q[6] = -0.2;
+    q[9] = 0.4;
+    q[10] = -0.2;
+
+    q[15] = 0.7;
+    q[18] = -0.5;
+    q[20] = -0.5;
+    q[22] = 0.7;
+    q[25] = -0.5;
+    q[27] = -0.5;
+    return q;
+}
+
+double vectorValueOrZero(const Eigen::VectorXd &value, int index)
+{
+    return (index >= 0 && index < value.size()) ? value(index) : 0.0;
+}
+}
+
 // MuJoCo load and compile model
 char error[1000] = "Could not load binary model";
-mjModel* mj_model = mj_loadXML("../models/scene_board.xml", 0, error, 1000);
+mjModel* mj_model = mj_loadXML("../models/g1/g1_29_withsensor.xml", 0, error, 1000);
 mjData* mj_data = mj_makeData(mj_model);
 
 //************************
 // main function
 int main(int argc, const char** argv)
 {
+    bool enableWalking = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg(argv[i]);
+        if (arg == "--walk")
+        {
+            enableWalking = true;
+        }
+    }
+
     // ini classes
     UIctr uiController(mj_model,mj_data);   // UI control for Mujoco
     MJ_Interface mj_interface(mj_model, mj_data); // data interface for Mujoco
-    Pin_KinDyn kinDynSolver("../models/AzureLoong.urdf"); // kinematics and dynamics solver
+    Pin_KinDyn kinDynSolver("../models/g1/g1_29_withsensor.urdf"); // kinematics and dynamics solver
     DataBus RobotState(kinDynSolver.model_nv); // data bus
-    WBC_priority WBC_solv(kinDynSolver.model_nv, 18, 22, 0.7, mj_model->opt.timestep); // WBC solver
-    GaitScheduler gaitScheduler(0.4, mj_model->opt.timestep); // gait scheduler
+    WBC_priority WBC_stand(kinDynSolver.model_nv, 18, 22, 1.0, mj_model->opt.timestep);
+    WBC_BruceWeighted WBC_bruce(kinDynSolver.model_nv, 1.0, mj_model->opt.timestep);
+    GaitScheduler gaitScheduler(0.3, mj_model->opt.timestep); // gait scheduler
     PVT_Ctr pvtCtr(mj_model->opt.timestep,"../common/joint_ctrl_config.json");// PVT joint control
     FootPlacement footPlacement; // foot-placement planner
     JoyStickInterpreter jsInterp(mj_model->opt.timestep); // desired baselink velocity generator
@@ -44,41 +103,40 @@ int main(int argc, const char** argv)
     StateEst StateModule(mj_model->opt.timestep);
 
     // variables ini
-    double stand_legLength = 1.01; // desired baselink height
-    double foot_height = 0.07; // distance between the foot ankel joint and the bottom
-    double  xv_des = 0.7;  // desired velocity in x direction
+    double stand_legLength = 0.65; // desired COM height above the stance foot for G1
+    double  xv_des = 0.1;  // desired velocity in x direction for G1 walking
+    const double walkComHeight = 0.65;
+    const double nominalFootForce = totalModelMass(mj_model) * 9.81 * 0.5;
 
-    RobotState.width_hips = 0.229;
+    RobotState.width_hips = 0.20;
     footPlacement.kp_vx = 0.03;
     footPlacement.kp_vy = 0.035;
     footPlacement.kp_wz = 0.03;
-    footPlacement.stepHeight = 0.12;
-    footPlacement.legLength=stand_legLength;
-    //mju_copy(mj_data->qpos, mj_model->key_qpos, mj_model->nq*1); // set ini pos in Mujoco
+    footPlacement.stepHeight = 0.10;
+    footPlacement.legLength = walkComHeight;
+    footPlacement.robotMass = totalModelMass(mj_model);
+    footPlacement.useAngularMomentumState = true;
+    footPlacement.dt = mj_model->opt.timestep;
     int model_nv=kinDynSolver.model_nv;
+    const auto g1StandPose = makeG1StandPose();
+    mj_interface.setMotorsPosition(g1StandPose);
+    mj_interface.dataBusWrite(RobotState);
+    const Eigen::Vector3d g1BasePosDes = RobotState.base_pos;
+    const double g1YawDes = RobotState.base_rpy(2);
+    const double g1BaseHeightDes = RobotState.base_pos(2);
+    jsInterp.setIniPos(g1BasePosDes(0), g1BasePosDes(1), g1BaseHeightDes, g1YawDes);
 
     // ini position and posture for foot-end and hand
-    std::vector<double> motors_pos_des(model_nv-6,0);
     std::vector<double> motors_pos_cur(model_nv-6,0);
     std::vector<double> motors_vel_des(model_nv-6,0);
     std::vector<double> motors_vel_cur(model_nv-6,0);
     std::vector<double> motors_tau_des(model_nv-6,0);
     std::vector<double> motors_tau_cur(model_nv-6,0);
-    Eigen::Vector3d fe_l_pos_L_des={-0.018, 0.113, -stand_legLength};
-    Eigen::Vector3d fe_r_pos_L_des={-0.018, -0.116, -stand_legLength};
-    Eigen::Vector3d fe_l_eul_L_des={-0.000, -0.008, -0.000};
-    Eigen::Vector3d fe_r_eul_L_des={0.000, -0.008, 0.000};
-    Eigen::Matrix3d fe_l_rot_des= eul2Rot(fe_l_eul_L_des(0),fe_l_eul_L_des(1),fe_l_eul_L_des(2));
-    Eigen::Matrix3d fe_r_rot_des= eul2Rot(fe_r_eul_L_des(0),fe_r_eul_L_des(1),fe_r_eul_L_des(2));
-
-    Eigen::Vector<double, 7> hd_l_des{0.475, -1.12, 1.9, 0.86, -0.356, 0, 0};
-    Eigen::Vector<double, 7> hd_r_des{-0.475, -1.12, -1.9, 0.86, 0.356, 0, 0};
-    auto resLeg=kinDynSolver.computeInK_Leg(fe_l_rot_des,fe_l_pos_L_des,fe_r_rot_des,fe_r_pos_L_des);
+    Eigen::VectorXd qMotorIni = Eigen::Map<const Eigen::VectorXd>(g1StandPose.data(), g1StandPose.size());
     Eigen::VectorXd qIniDes=Eigen::VectorXd::Zero(mj_model->nq,1);
-    qIniDes.block(7, 0, mj_model->nq - 7, 1) = resLeg.jointPosRes;
-    qIniDes.block(7, 0, 7, 1) = hd_l_des;
-    qIniDes.block(14, 0, 7, 1) = hd_r_des;
-    WBC_solv.setQini(qIniDes,RobotState.q);
+    qIniDes.block(7, 0, model_nv - 6, 1) = qMotorIni;
+    WBC_stand.setQini(qIniDes, RobotState.q);
+    WBC_bruce.setQini(qIniDes, RobotState.q);
 
     // register variable name for data logger
     logger.addIterm("simTime", 1);
@@ -91,14 +149,33 @@ int main(int argc, const char** argv)
     logger.addIterm("baseLinVel",3);
     logger.addIterm("baseAcc",3);
     logger.addIterm("baseAngVel",3);
+    logger.addIterm("legState", 1);
+    logger.addIterm("phi", 1);
+    logger.addIterm("swingFinal", 3);
+    logger.addIterm("swingCur", 3);
+    logger.addIterm("stancePos", 3);
+    logger.addIterm("wbcFr", 12);
+    logger.addIterm("qpStatus", 1);
     logger.finishItermAdding();
 
     /// ----------------- sim Loop ---------------
     double simEndTime=30;
     mjtNum simstart = mj_data->time;
     double simTime = mj_data->time;
-    double startSteppingTime=3;
-    double startWalkingTime=5;
+    double startShiftTime=2.0;
+    double startSteppingTime=3.0;
+    double startWalkingTime=3.0;
+    Eigen::Vector3d pCoMStandDes = Eigen::Vector3d::Zero();
+    bool pCoMStandDesInitialized = false;
+    bool gaitStarted = false;
+    enum class PipelineMode
+    {
+        Null,
+        Standing,
+        Walking
+    };
+    PipelineMode currentMode = PipelineMode::Null;
+    double lastCommandedVx = std::numeric_limits<double>::quiet_NaN();
 
     // init UI: GLFW
     uiController.iniGLFW();
@@ -121,15 +198,7 @@ int main(int argc, const char** argv)
             mj_interface.updateSensorValues();
             mj_interface.dataBusWrite(RobotState);
 
-            if (simTime > 1 && StateModule.flag_init)
-            {
-                std::cout << "init state module" << std::endl;
-                StateModule.init(RobotState);
-            }
-            
-            StateModule.set(RobotState);
-            StateModule.update();
-            StateModule.get(RobotState);
+            RobotState.motionState = DataBus::Stand;
 
             // update kinematics and dynamics info
             kinDynSolver.dataBusRead(RobotState);
@@ -137,26 +206,87 @@ int main(int argc, const char** argv)
             kinDynSolver.computeDyn();
             kinDynSolver.dataBusWrite(RobotState);
 
-            StateModule.setF(RobotState);
-            StateModule.updateF();
-            StateModule.getF(RobotState);
+            if (kUseStateEstimatorInMujoco && simTime > 1 && StateModule.flag_init)
+            {
+                std::cout << "init state module" << std::endl;
+                StateModule.init(RobotState);
+            }
 
-            // Enter here functions to send actuator commands, like:
-            // arm-l: 0-6, arm-r: 7-13, head: 14,15, waist: 16-18, leg-l: 19-24, leg-r: 25-30
-            if (simTime > startWalkingTime) {
+            if (kUseStateEstimatorInMujoco && !StateModule.flag_init)
+            {
+                StateModule.set(RobotState);
+                StateModule.update();
+                StateModule.get(RobotState);
+
+                // StateEst updates base velocity/angular velocity. Recompute
+                // kinematics/dynamics so planner and WBC consume one coherent
+                // current-cycle state, matching the RoMoCo pipeline ordering.
+                kinDynSolver.dataBusRead(RobotState);
+                kinDynSolver.computeJ_dJ();
+                kinDynSolver.computeDyn();
+                kinDynSolver.dataBusWrite(RobotState);
+            }
+
+            if (!pCoMStandDesInitialized)
+            {
+                pCoMStandDes = RobotState.pCoM_W;
+                WBC_bruce.pCoMDes = pCoMStandDes;
+                WBC_bruce.pCoMDesInitialized = true;
+                pCoMStandDesInitialized = true;
+            }
+
+            if (false)
+            {
+                StateModule.setF(RobotState);
+                StateModule.updateF();
+                StateModule.getF(RobotState);
+            }
+
+            const bool readyToWalk =
+                !enableWalking || simTime >= startWalkingTime ||
+                std::abs(RobotState.pCoM_W(1) - pCoMStandDes(1)) >= 0.03;
+            const bool requestWalkingMode = enableWalking && simTime >= startShiftTime && readyToWalk;
+            const PipelineMode requestedMode = requestWalkingMode ? PipelineMode::Walking : PipelineMode::Standing;
+            if (requestedMode != currentMode)
+            {
+                currentMode = requestedMode;
+                if (currentMode == PipelineMode::Walking)
+                {
+                    gaitScheduler.stop();
+                    gaitStarted = false;
+                    WBC_bruce.pCoMDesInitialized = false;
+                }
+                else
+                {
+                    gaitScheduler.stop();
+                    jsInterp.setIniPos(RobotState.q(0), RobotState.q(1), g1BaseHeightDes, RobotState.base_rpy(2));
+                }
+            }
+
+            if (currentMode == PipelineMode::Walking) {
                 jsInterp.setWzDesLPara(0, 1);
-                jsInterp.setVxDesLPara(xv_des, 2.0); // jsInterp.setVxDesLPara(0.9,1);
-                RobotState.motionState = DataBus::Walk; // start walking
-            } else
-                jsInterp.setIniPos(RobotState.q(0), RobotState.q(1), RobotState.base_rpy(2));
+                if (!std::isfinite(lastCommandedVx) || std::abs(lastCommandedVx - xv_des) > 1e-9)
+                {
+                    jsInterp.setVxDesLPara(xv_des, 2.0);
+                    lastCommandedVx = xv_des;
+                }
+            } else {
+                lastCommandedVx = std::numeric_limits<double>::quiet_NaN();
+                jsInterp.setIniPos(RobotState.q(0), RobotState.q(1), g1BaseHeightDes, RobotState.base_rpy(2));
+                gaitStarted = false;
+            }
 
-            if (simTime >= startSteppingTime) {
+            const bool plannerActive = currentMode == PipelineMode::Walking && simTime >= startSteppingTime;
+            if (plannerActive) {
                 jsInterp.step();
-                jsInterp.setIniPos(RobotState.q(0), RobotState.q(1), stand_legLength + foot_height, RobotState.base_rpy(2));
                 jsInterp.dataBusWrite(RobotState); // only pos x, pos y, pos_z, theta z, vel x, vel y , omega z are rewrote.
-                // gait scheduler
-                gaitScheduler.start();
                 RobotState.motionState = DataBus::Walk;
+                if (!gaitStarted)
+                {
+                    gaitScheduler.start();
+                    gaitStarted = true;
+                }
+
                 gaitScheduler.dataBusRead(RobotState);
                 gaitScheduler.step();
                 gaitScheduler.dataBusWrite(RobotState);
@@ -165,17 +295,76 @@ int main(int argc, const char** argv)
                 footPlacement.getSwingPos();
                 footPlacement.dataBusWrite(RobotState);
             }
+            else {
+                RobotState.motionState = DataBus::Stand;
+                RobotState.legState = DataBus::DSt;
+                RobotState.walk_stance_leg = DataBus::RSt;
+                RobotState.legStateNext = DataBus::LSt;
+                RobotState.phi = 0.0;
+                RobotState.walk_is_double_support = true;
+                RobotState.walk_left_contact = true;
+                RobotState.walk_right_contact = true;
+                RobotState.walk_time_to_impact = 0.0;
+                RobotState.stance_fe_pos_cur_W = RobotState.fe_r_pos_W;
+                RobotState.stance_fe_rot_cur_W = RobotState.fe_r_rot_W;
+            }
 
-            // ------------- WBC ------------
-            // WBC input
+            // ------------- Contact/reference pipeline ------------
             RobotState.des_ddq = Eigen::VectorXd::Zero(mj_model->nv);
             RobotState.des_dq = Eigen::VectorXd::Zero(mj_model->nv);
             RobotState.des_delta_q = Eigen::VectorXd::Zero(mj_model->nv);
-            RobotState.Fr_ff << 0,0,370,0,0,0,
-                                0,0,370,0,0,0;
+            const double firstStanceYOffset = 0.04;
+            const double shiftDen = std::max(1e-3, startSteppingTime - startShiftTime);
+            const double shiftPhase = std::clamp((simTime - startShiftTime) / shiftDen, 0.0, 1.0);
+            const double shiftBlend = shiftPhase * shiftPhase * (3.0 - 2.0 * shiftPhase);
+            if (RobotState.motionState == DataBus::Stand)
+            {
+                RobotState.base_rpy_des << 0.0, 0.0, g1YawDes;
+                RobotState.base_pos_des = g1BasePosDes;
+                WBC_bruce.pCoMDes = pCoMStandDes;
+                if (enableWalking)
+                {
+                    const double footZ = 0.5 * (RobotState.fe_l_pos_W(2) + RobotState.fe_r_pos_W(2));
+                    const double walkReadyCoMZ = footZ + walkComHeight;
+                    WBC_bruce.pCoMDes(1) += firstStanceYOffset * shiftBlend;
+                    WBC_bruce.pCoMDes(2) = (1.0 - shiftBlend) * pCoMStandDes(2) + shiftBlend * walkReadyCoMZ;
+                    RobotState.base_pos_des(2) = g1BaseHeightDes + WBC_bruce.pCoMDes(2) - pCoMStandDes(2);
+                }
+                RobotState.walk_target_yaw = RobotState.base_rpy_des(2);
+                RobotState.walk_target_yaw_rate = 0.0;
+                const double supportZ = 0.5 * (RobotState.fe_l_pos_W.z() + RobotState.fe_r_pos_W.z());
+                RobotState.walk_target_com_height = WBC_bruce.pCoMDes.z() - supportZ;
+                RobotState.walk_yd(0) = RobotState.walk_target_com_height;
+                RobotState.Fr_ff << 0, 0, nominalFootForce, 0, 0, 0,
+                                    0, 0, nominalFootForce, 0, 0, 0;
+            }
+            else
+            {
+                RobotState.base_rpy_des << 0.0, 0.0, RobotState.walk_target_yaw;
+                RobotState.base_pos_des = g1BasePosDes;
+                const double targetCoMHeight =
+                    (RobotState.walk_yd.size() >= 1) ? RobotState.walk_yd(0) : walkComHeight;
+                const double targetCoMZ = RobotState.stance_fe_pos_cur_W.z() + targetCoMHeight;
+                RobotState.base_pos_des(2) = g1BaseHeightDes + targetCoMZ - pCoMStandDes(2);
+                RobotState.walk_target_com_height = targetCoMHeight;
+                if (RobotState.walk_is_double_support)
+                {
+                    RobotState.Fr_ff << 0, 0, nominalFootForce, 0, 0, 0,
+                                        0, 0, nominalFootForce, 0, 0, 0;
+                }
+                else if (RobotState.walk_left_contact)
+                {
+                    RobotState.Fr_ff << 0, 0, 2.0 * nominalFootForce, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0;
+                }
+                else
+                {
+                    RobotState.Fr_ff << 0, 0, 0, 0, 0, 0,
+                                        0, 0, 2.0 * nominalFootForce, 0, 0, 0;
+                }
+            }
 
-            // adjust des_delata_q, des_dq and des_ddq to achieve forward walking
-            if (simTime > startWalkingTime + 1) {
+            if (currentMode == PipelineMode::Walking) {
                 RobotState.des_delta_q.block<2, 1>(0, 0) << jsInterp.vx_W * mj_model->opt.timestep, jsInterp.vy_W * mj_model->opt.timestep;
                 RobotState.des_delta_q(5) = jsInterp.wz_L * mj_model->opt.timestep;
                 RobotState.des_dq.block<2, 1>(0, 0) << jsInterp.vx_W, jsInterp.vy_W;
@@ -189,55 +378,71 @@ int main(int argc, const char** argv)
 
 
             // WBC Calculation
-            WBC_solv.dataBusRead(RobotState);
-            WBC_solv.computeDdq(kinDynSolver);
-            WBC_solv.computeTau();
-            WBC_solv.dataBusWrite(RobotState);
-
-            // get the final joint command
-            if (simTime<=startSteppingTime){
-                Eigen::VectorXd temp = resLeg.jointPosRes;
-                temp.block(0, 0, 7, 1) = hd_l_des;
-                temp.block(7, 0, 7, 1) = hd_r_des;
-                RobotState.motors_pos_des = eigen2std(temp);
-                RobotState.motors_vel_des=motors_vel_des;
-                RobotState.motors_tor_des=motors_tau_des;
+            if (RobotState.motionState == DataBus::Stand)
+            {
+                WBC_stand.pCoMDes = WBC_bruce.pCoMDes;
+                WBC_stand.pCoMDesInitialized = true;
+                WBC_stand.dataBusRead(RobotState);
+                WBC_stand.computeDdq(kinDynSolver);
+                WBC_stand.computeTau();
+                WBC_stand.dataBusWrite(RobotState);
             }
             else
             {
-                Eigen::VectorXd pos_des=kinDynSolver.integrateDIY(RobotState.q, RobotState.wbc_delta_q_final);
-                RobotState.motors_pos_des = eigen2std(pos_des.block(7,0, model_nv-6,1));
-                RobotState.motors_vel_des = eigen2std(RobotState.wbc_dq_final);
-                RobotState.motors_tor_des = eigen2std(RobotState.wbc_tauJointRes);
+                WBC_bruce.dataBusRead(RobotState);
+                WBC_bruce.computeDdq(kinDynSolver);
+                WBC_bruce.computeTau();
+                WBC_bruce.dataBusWrite(RobotState);
+            }
+
+            // get the final joint command
+            Eigen::VectorXd pos_des=kinDynSolver.integrateDIY(RobotState.q, RobotState.wbc_delta_q_final);
+            RobotState.motors_pos_des = eigen2std(pos_des.block(7,0, model_nv-6,1));
+            RobotState.motors_vel_des = eigen2std(RobotState.wbc_dq_final.block(6,0, model_nv-6,1));
+            RobotState.motors_tor_des = eigen2std(RobotState.wbc_tauJointRes);
+            std::vector<bool> activeLegMotor(std::min(12, model_nv - 6), false);
+            if (RobotState.motionState == DataBus::Walk)
+            {
+                for (int motorId : RobotState.wbc_active_motor_ids)
+                {
+                    if (motorId >= 0 && motorId < static_cast<int>(activeLegMotor.size()))
+                    {
+                        activeLegMotor[motorId] = true;
+                    }
+                }
+                for (int i = 0; i < static_cast<int>(activeLegMotor.size()); ++i)
+                {
+                    if (!activeLegMotor[i])
+                    {
+                        RobotState.motors_pos_des[i] = RobotState.motors_pos_cur[i];
+                        RobotState.motors_vel_des[i] = 0.0;
+                        RobotState.motors_tor_des[i] = 0.0;
+                    }
+                }
+            }
+            for (int i = 12; i < model_nv - 6 && i < static_cast<int>(g1StandPose.size()); ++i)
+            {
+                RobotState.motors_pos_des[i] = g1StandPose[i];
+                RobotState.motors_vel_des[i] = 0.0;
+                RobotState.motors_tor_des[i] = 0.0;
             }
 
             pvtCtr.dataBusRead(RobotState);
-            if (simTime<=3)
             {
-                pvtCtr.calMotorsPVT(100.0/1000.0/180.0*3.1415);
-            }
-            else
-            {
-                double kp = 1.;
-                double kd = 1.;
-
-                pvtCtr.setJointPD(400 * kp, 15 * kd, "J_hip_l_roll");
-                pvtCtr.setJointPD(200 * kp, 10 * kd, "J_hip_l_yaw");
-                pvtCtr.setJointPD(300 * kp, 10 * kd, "J_hip_l_pitch");
-                pvtCtr.setJointPD(300 * kp, 14 * kd, "J_knee_l_pitch");
-                pvtCtr.setJointPD(300 * kp, 18 * kd, "J_ankle_l_pitch");
-                pvtCtr.setJointPD(300 * kp, 16 * kd, "J_ankle_l_roll");
-
-                pvtCtr.setJointPD(400 * kp, 15 * kd, "J_hip_r_roll");
-                pvtCtr.setJointPD(200 * kp, 10 * kd, "J_hip_r_yaw");
-                pvtCtr.setJointPD(300 * kp, 10 * kd, "J_hip_r_pitch");
-                pvtCtr.setJointPD(300 * kp, 14 * kd, "J_knee_r_pitch");
-                pvtCtr.setJointPD(300 * kp, 18 * kd, "J_ankle_r_pitch");
-                pvtCtr.setJointPD(300 * kp, 16 * kd, "J_ankle_r_roll");
-
                 pvtCtr.calMotorsPVT();
             }
             pvtCtr.dataBusWrite(RobotState);
+            if (RobotState.motionState == DataBus::Walk)
+            {
+                for (int i = 0; i < static_cast<int>(activeLegMotor.size()); ++i)
+                {
+                    if (!activeLegMotor[i])
+                    {
+                        RobotState.motors_tor_out[i] = 0.0;
+                        RobotState.motors_tor_cur[i] = 0.0;
+                    }
+                }
+            }
 
             mj_interface.setMotorsTorque(RobotState.motors_tor_out);
 
@@ -252,11 +457,49 @@ int main(int argc, const char** argv)
             logger.recItermData("baseLinVel",RobotState.baseLinVel);
             logger.recItermData("baseAcc",RobotState.baseAcc);
             logger.recItermData("baseAngVel",RobotState.baseAngVel);
+            logger.recItermData("legState", static_cast<double>(RobotState.legState));
+            logger.recItermData("phi", RobotState.phi);
+            logger.recItermData("swingFinal", RobotState.swingDesPosFinal_W);
+            logger.recItermData("swingCur", RobotState.swingDesPosCur_W);
+            logger.recItermData("stancePos", RobotState.stance_fe_pos_cur_W);
+            logger.recItermData("wbcFr", RobotState.wbc_FrRes);
+            logger.recItermData("qpStatus", static_cast<double>(RobotState.qp_status));
             logger.finishLine();
 
             printf("rpyVal=[%.5f, %.5f, %.5f]\n", RobotState.rpy[0], RobotState.rpy[1], RobotState.rpy[2]);
             printf("gps=[%.5f, %.5f, %.5f]\n", RobotState.basePos[0], RobotState.basePos[1], RobotState.basePos[2]);
             printf("vel=[%.5f, %.5f, %.5f]\n", RobotState.baseLinVel[0], RobotState.baseLinVel[1], RobotState.baseLinVel[2]);
+            printf("wbcAnkleTau[Nm]: L_pitch=%.5f, L_roll=%.5f, R_pitch=%.5f, R_roll=%.5f\n",
+                   vectorValueOrZero(RobotState.wbc_tauJointRes, kLeftAnklePitchMotorId),
+                   vectorValueOrZero(RobotState.wbc_tauJointRes, kLeftAnkleRollMotorId),
+                   vectorValueOrZero(RobotState.wbc_tauJointRes, kRightAnklePitchMotorId),
+                   vectorValueOrZero(RobotState.wbc_tauJointRes, kRightAnkleRollMotorId));
+            printf("wbcDesiredGRF_Fr_ff[L/R:Fx,Fy,Fz,Mx,My,Mz]=[%.5f, %.5f, %.5f, %.5f, %.5f, %.5f] / [%.5f, %.5f, %.5f, %.5f, %.5f, %.5f]\n",
+                   vectorValueOrZero(RobotState.Fr_ff, 0),
+                   vectorValueOrZero(RobotState.Fr_ff, 1),
+                   vectorValueOrZero(RobotState.Fr_ff, 2),
+                   vectorValueOrZero(RobotState.Fr_ff, 3),
+                   vectorValueOrZero(RobotState.Fr_ff, 4),
+                   vectorValueOrZero(RobotState.Fr_ff, 5),
+                   vectorValueOrZero(RobotState.Fr_ff, 6),
+                   vectorValueOrZero(RobotState.Fr_ff, 7),
+                   vectorValueOrZero(RobotState.Fr_ff, 8),
+                   vectorValueOrZero(RobotState.Fr_ff, 9),
+                   vectorValueOrZero(RobotState.Fr_ff, 10),
+                   vectorValueOrZero(RobotState.Fr_ff, 11));
+            printf("wbcSolvedGRF[L/R:Fx,Fy,Fz,Mx,My,Mz]=[%.5f, %.5f, %.5f, %.5f, %.5f, %.5f] / [%.5f, %.5f, %.5f, %.5f, %.5f, %.5f]\n",
+                   vectorValueOrZero(RobotState.wbc_FrRes, 0),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 1),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 2),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 3),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 4),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 5),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 6),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 7),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 8),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 9),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 10),
+                   vectorValueOrZero(RobotState.wbc_FrRes, 11));
         }
 
         if (mj_data->time>=simEndTime)

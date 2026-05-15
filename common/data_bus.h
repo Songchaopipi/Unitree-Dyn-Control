@@ -45,7 +45,10 @@ struct DataBus
     Eigen::VectorXd qOld;
     Eigen::MatrixXd J_base, J_l, J_r, J_hd_l, J_hd_r, J_hip_link;
     Eigen::MatrixXd dJ_base, dJ_l, dJ_r, dJ_hd_l, dJ_hd_r;
+    Eigen::MatrixXd J_l_foot, J_r_foot;
+    Eigen::VectorXd dJ_l_foot, dJ_r_foot;
     Eigen::MatrixXd Jcom_W; // jacobian of CoM, in world frame
+    Eigen::Vector3d dJcom_W; // Jdot_com * dq, in world frame
     Eigen::Vector3d pCoM_W;
     Eigen::Vector3d fe_r_pos_W, fe_l_pos_W, base_pos, base_vel;
     Eigen::Matrix3d fe_r_rot_W, fe_l_rot_W, base_rot; // in world frame
@@ -112,13 +115,41 @@ struct DataBus
     Eigen::Vector3d base_omega_des;
     Eigen::VectorXd des_ddq, des_dq, des_delta_q, des_q;
     Eigen::Vector3d swing_fe_pos_des_W;
+    Eigen::Vector3d swing_fe_vel_des_W;
+    Eigen::Vector3d swing_fe_acc_des_W;
     Eigen::Vector3d swing_fe_rpy_des_W;
+    Eigen::VectorXd walk_yd;
+    Eigen::VectorXd walk_dyd;
+    Eigen::VectorXd walk_d2yd;
+    double walk_target_yaw{0.0};
+    double walk_target_yaw_rate{0.0};
+    double walk_target_com_height{0.65};
+    double walk_desired_vx{0.0};
+    double walk_desired_vy{0.0};
+    bool walk_is_double_support{true};
+    bool walk_left_contact{true};
+    bool walk_right_contact{true};
+    double walk_phase_time{0.0};
+    double walk_time_to_impact{0.0};
     Eigen::Vector3d stance_fe_pos_cur_W;
     Eigen::Matrix3d stance_fe_rot_cur_W;
     Eigen::VectorXd wbc_delta_q_final, wbc_dq_final, wbc_ddq_final;
     Eigen::VectorXd wbc_tauJointRes;
     Eigen::VectorXd wbc_FrRes;
+    std::vector<int> wbc_active_motor_ids;
     Eigen::VectorXd Fr_ff;
+    bool srbd_mpc_rp_enabled{false};
+    Eigen::Vector2d srbd_mpc_torso_tau_rp;
+    Eigen::Vector2d srbd_mpc_torso_rp_des;
+    Eigen::Vector2d srbd_mpc_torso_rp_rate_des;
+    bool centroidal_nmpc_enabled{false};
+    Eigen::Vector3d centroidal_nmpc_com_pos_des;
+    Eigen::Vector3d centroidal_nmpc_com_vel_des;
+    Eigen::Vector3d centroidal_nmpc_com_acc_des;
+    Eigen::VectorXd centroidal_nmpc_Fr_des;
+    int centroidal_nmpc_status{0};
+    int centroidal_nmpc_nWSR{0};
+    double centroidal_nmpc_cpuTime{0.0};
     int qp_nWSR;
     double qp_cpuTime;
     int qp_status;
@@ -135,6 +166,7 @@ struct DataBus
     double theta0;          // offset yaw angle of the swing leg, w.r.t body frame
     double width_hips;      // distance between the left and right hip
     double tSwing;
+    double tDoubleSupport;
     double phi;
     enum MotionState
     {
@@ -150,6 +182,7 @@ struct DataBus
     };
     bool leg_contact[2];
     double thetaZ_des{0};
+    LegState walk_stance_leg{DataBus::LSt};
     LegState legState{DataBus::DSt};
     LegState legStateNext{DataBus::DSt};
     MotionState motionState{DataBus::Stand};
@@ -181,8 +214,23 @@ struct DataBus
         X_cur = Eigen::VectorXd::Zero(12);
         X_cal = Eigen::VectorXd::Zero(12);
         dX_cal = Eigen::VectorXd::Zero(12);
+        J_l_foot = Eigen::MatrixXd::Zero(6, model_nv);
+        J_r_foot = Eigen::MatrixXd::Zero(6, model_nv);
+        dJ_l_foot = Eigen::VectorXd::Zero(6);
+        dJ_r_foot = Eigen::VectorXd::Zero(6);
+        Jcom_W = Eigen::MatrixXd::Zero(3, model_nv);
+        dJcom_W.setZero();
         fe_react_tau_cmd = Eigen::VectorXd::Zero(13 * 3);
         Fr_ff = Eigen::VectorXd::Zero(12);
+        srbd_mpc_rp_enabled = false;
+        srbd_mpc_torso_tau_rp.setZero();
+        srbd_mpc_torso_rp_des.setZero();
+        srbd_mpc_torso_rp_rate_des.setZero();
+        centroidal_nmpc_enabled = false;
+        centroidal_nmpc_com_pos_des.setZero();
+        centroidal_nmpc_com_vel_des.setZero();
+        centroidal_nmpc_com_acc_des.setZero();
+        centroidal_nmpc_Fr_des = Eigen::VectorXd::Zero(12);
         des_ddq = Eigen::VectorXd::Zero(model_nv);
         des_dq = Eigen::VectorXd::Zero(model_nv);
         des_delta_q = Eigen::VectorXd::Zero(model_nv);
@@ -190,6 +238,19 @@ struct DataBus
         base_pos_des.setZero();
         base_vel_des.setZero();
         base_omega_des.setZero();
+        swing_fe_pos_des_W.setZero();
+        swing_fe_vel_des_W.setZero();
+        swing_fe_acc_des_W.setZero();
+        swing_fe_rpy_des_W.setZero();
+        walk_yd = Eigen::VectorXd::Zero(10);
+        walk_dyd = Eigen::VectorXd::Zero(10);
+        walk_d2yd = Eigen::VectorXd::Zero(10);
+        walk_is_double_support = true;
+        walk_left_contact = true;
+        walk_right_contact = true;
+        walk_phase_time = 0.0;
+        tDoubleSupport = 0.0;
+        walk_stance_leg = LSt;
         js_eul_des.setZero();
         js_pos_des.setZero();
         js_omega_des.setZero();

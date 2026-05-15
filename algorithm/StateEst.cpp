@@ -1,15 +1,9 @@
-/*
-This is part of OpenLoong Dynamics Control, an open project for the control of biped robot,
-Copyright (C) 2024-2025 Humanoid Robot (Shanghai) Co., Ltd.
-Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any style, to contribute to the advancement of the community.
- <https://atomgit.com/openloong/openloong-dyn-control.git>
- <web@openloong.org.cn>
-*/
 
 #include "StateEst.h"
 #include "iostream"
 #include "data_bus.h"
 #include <chrono>
+#include <algorithm>
 
 using namespace Eigen;
 
@@ -61,10 +55,6 @@ eul_w_filter(dtIn)
     peB_old.setZero();
     peW_old.setZero();
 
-    //    std::cout<<"A"<<std::endl<<A<<std::endl;
-    //    std::cout<<"B"<<std::endl<<B<<std::endl;
-    //    std::cout<<"C"<<std::endl<<C<<std::endl;
-
     vCoM_LP[0] = 0;
     vCoM_LP[1] = 0;
     vCoM_LP[2] = 0;
@@ -84,6 +74,24 @@ eul_w_filter(dtIn)
     eul_w_filter.R(3, 3) = 1e-4; // 1e-4;//
     eul_w_filter.R(4, 4) = 1e-4; // 1e-3;//
     eul_w_filter.R(5, 5) = 1e-5; // 1e-3;//
+
+    Fk_contact.setIdentity();
+    Hk_contact.setZero();
+    Hk_contact.block<3, 3>(0, 0) = -Matrix3d::Identity();
+    Hk_contact.block<3, 3>(3, 0) = -Matrix3d::Identity();
+    Hk_contact.block<3, 3>(0, 6) = Matrix3d::Identity();
+    Hk_contact.block<3, 3>(3, 9) = Matrix3d::Identity();
+    Qc_contact.setZero();
+    Qc_contact.block<3, 3>(0, 0) = 0.01 * Matrix3d::Identity();
+    Qc_contact.block<3, 3>(3, 3) = 0.01 * Matrix3d::Identity();
+    Qc_contact.block<3, 3>(6, 6) = 0.0025 * Matrix3d::Identity();
+    Qc_contact.block<3, 3>(9, 9) = 0.0025 * Matrix3d::Identity();
+    Qc_contact.block<3, 3>(12, 12) = 0.0625 * Matrix3d::Identity();
+    Renc_contact = 0.0001 * Matrix3d::Identity();
+    Rc_contact.setIdentity();
+    Kk_contact.setZero();
+    yk_contact.setZero();
+    contact_state.setZero();
 }
 
 void StateEst::init(DataBus &Data)
@@ -133,6 +141,8 @@ void StateEst::init(DataBus &Data)
     KF_R_wh = Eigen::Matrix<double, 2, 1>::Ones() * 1e-3;
 
     KF_Q_waU << 2e-4, 2e-4, 8e-4;
+    contact_kf_initialized = false;
+    initContactKf(Data.base_rot * Data.fe_l_pos_L, Data.base_rot * Data.fe_r_pos_L);
 }
 
 void StateEst::set(DataBus &Data)
@@ -168,12 +178,113 @@ void StateEst::set(DataBus &Data)
 
     phi = Data.phi;
     legState = Data.legState;
+    timeNow += dt;
     fe_l_pos_L = Data.fe_l_pos_L;
     fe_r_pos_L = Data.fe_r_pos_L;
     fe_l_vel_L = Data.fe_l_vel_L;
     fe_r_vel_L = Data.fe_r_vel_L;
     fe_l_pos_W = Data.fe_l_pos_W;
     fe_r_pos_W = Data.fe_r_pos_W;
+
+    auto contactProbability = [](double fz)
+    {
+        return std::clamp((fz - 60.0) / 50.0, 0.0, 1.0);
+    };
+    const double alpha = std::clamp(dt / (0.005 + dt), 0.0, 1.0);
+    left_contact_prob_lp += alpha * (contactProbability(Data.fL[2]) - left_contact_prob_lp);
+    right_contact_prob_lp += alpha * (contactProbability(Data.fR[2]) - right_contact_prob_lp);
+    left_contact_prob = left_contact_prob_lp;
+    right_contact_prob = right_contact_prob_lp;
+    if (Data.legState == DataBus::LSt)
+    {
+        left_contact_prob = std::max(left_contact_prob, 1.0);
+        right_contact_prob = std::min(right_contact_prob, 0.2);
+    }
+    else if (Data.legState == DataBus::RSt)
+    {
+        right_contact_prob = std::max(right_contact_prob, 1.0);
+        left_contact_prob = std::min(left_contact_prob, 0.2);
+    }
+    else
+    {
+        left_contact_prob = std::max(left_contact_prob, 1.0);
+        right_contact_prob = std::max(right_contact_prob, 1.0);
+    }
+}
+
+void StateEst::initContactKf(const Eigen::Vector3d &plf, const Eigen::Vector3d &prf)
+{
+    if (left_contact_prob <= 0.5 || right_contact_prob <= 0.5)
+    {
+        return;
+    }
+    contact_state.setZero();
+    contact_state(2) = -(plf.z() + prf.z()) * 0.5;
+    contact_state.segment<3>(6) = contact_state.segment<3>(0) + plf;
+    contact_state.segment<3>(9) = contact_state.segment<3>(0) + prf;
+    P.setZero();
+    P.block<3, 3>(0, 0) = 0.0001 * Matrix3d::Identity();
+    P.block<3, 3>(3, 3) = 0.01 * Matrix3d::Identity();
+    P.block<3, 3>(6, 6) = 0.000625 * Matrix3d::Identity();
+    P.block<3, 3>(9, 9) = 0.000625 * Matrix3d::Identity();
+    P.block<3, 3>(12, 12) = 0.01 * Matrix3d::Identity();
+    contact_kf_initialized = true;
+}
+
+void StateEst::predictContactKf(double leftProb, double rightProb)
+{
+    Eigen::Vector3d p = contact_state.segment<3>(0);
+    Eigen::Vector3d v = contact_state.segment<3>(3);
+    const Eigen::Vector3d plf = contact_state.segment<3>(6);
+    const Eigen::Vector3d prf = contact_state.segment<3>(9);
+    const Eigen::Vector3d ba = contact_state.segment<3>(12);
+
+    const Eigen::Vector3d accWorld = Rrpy * (acc - ba) + gravity_contact;
+    p = p + v * dt + 0.5 * accWorld * dt * dt;
+    v = v + accWorld * dt;
+
+    contact_state.segment<3>(0) = p;
+    contact_state.segment<3>(3) = v;
+    contact_state.segment<3>(6) = plf;
+    contact_state.segment<3>(9) = prf;
+    contact_state.segment<3>(12) = ba;
+
+    Fk_contact.setIdentity();
+    Fk_contact.block<3, 3>(0, 3) = dt * Matrix3d::Identity();
+    Fk_contact.block<3, 3>(0, 12) = -Rrpy * (0.5 * dt * dt);
+    Fk_contact.block<3, 3>(3, 12) = -Rrpy * dt;
+
+    Eigen::Matrix<double,15,15> Qk = Qc_contact;
+    if (leftProb < rightProb)
+    {
+        Qk.block<3, 3>(6, 6) = 1e6 * Matrix3d::Identity();
+    }
+    else if (rightProb < leftProb)
+    {
+        Qk.block<3, 3>(9, 9) = 1e6 * Matrix3d::Identity();
+    }
+
+    P = Fk_contact * P * Fk_contact.transpose() + Qk;
+}
+
+void StateEst::updateContactKf(const Eigen::Vector3d &plfEnc, const Eigen::Vector3d &prfEnc)
+{
+    const Eigen::Vector3d p = contact_state.segment<3>(0);
+    const Eigen::Vector3d plf = contact_state.segment<3>(6);
+    const Eigen::Vector3d prf = contact_state.segment<3>(9);
+
+    yk_contact.segment<3>(0) = plfEnc - (plf - p);
+    yk_contact.segment<3>(3) = prfEnc - (prf - p);
+
+    Rc_contact.setZero();
+    Rc_contact.block<3, 3>(0, 0) = (1e-4 + (1.0 - left_contact_prob) * 1e6) * Matrix3d::Identity();
+    Rc_contact.block<3, 3>(3, 3) = (1e-4 + (1.0 - right_contact_prob) * 1e6) * Matrix3d::Identity();
+
+    const Eigen::Matrix<double,6,6> Sk = Hk_contact * P * Hk_contact.transpose() + Rc_contact;
+    Kk_contact = P * Hk_contact.transpose() * Sk.inverse();
+    const Eigen::Matrix<double,15,1> dx = Kk_contact * yk_contact;
+    contact_state += dx;
+    P = (Matrix<double,15,15>::Identity() - Kk_contact * Hk_contact) * P;
 }
 
 void StateEst::getTrustRegion_wt_h()
@@ -214,6 +325,25 @@ void StateEst::getTrustRegion_wt_h()
 // for qFB_all:=[qL[1-4],qPas[1-2],qL[5],qR[1-4],qPas[3-4],qR[5]]; feedback positions whose offset is defined in URDF
 void StateEst::update()
 {
+    peB.block<3, 1>(0, 0) = fe_l_pos_L;
+    peB.block<3, 1>(0, 1) = fe_r_pos_L;
+    pbW = Rrpy * peB;
+    if (!contact_kf_initialized)
+    {
+        initContactKf(pbW.col(0), pbW.col(1));
+    }
+    if (contact_kf_initialized)
+    {
+        predictContactKf(left_contact_prob, right_contact_prob);
+        updateContactKf(pbW.col(0), pbW.col(1));
+        base_pos = contact_state.segment<3>(0);
+        base_vel = contact_state.segment<3>(3);
+        fe_l_pos_W = contact_state.segment<3>(6);
+        fe_r_pos_W = contact_state.segment<3>(9);
+        delta_acc = contact_state.segment<3>(12);
+        return;
+    }
+
     // if (FRest[2] > FcontactUpp[1])
     //     leg_contact[1] = true;
     // else if (FRest[2] < FcontactLow[1])
@@ -339,25 +469,20 @@ void StateEst::get(DataBus &Data)
     Data.eul_est = eul_woOff; // attention!!!! without yaw offset!!!!
     Data.omegaW_est = omegaW;
 
-    Data.base_pos = Data.base_pos_est;
-    Data.base_vel = Data.base_vel_est;
+    // RoMoCo uses the contact KF primarily for base linear velocity when an
+    // external base-position source is already available.  Keep MuJoCo's base
+    // pose in this demo and only feed back the estimated velocity.
+    if (Data.motionState == DataBus::Walk)
+        Data.base_vel = Data.base_vel_est;
     // Data.fe_l_pos_W = Data.fe_l_pos_W_est;
     // Data.fe_r_pos_W = Data.fe_r_pos_W_est;
     Data.baseAcc[0] += delta_acc[0];
     Data.baseAcc[1] += delta_acc[1];
     Data.baseAcc[2] += delta_acc[2];
-    Data.base_rpy = Data.eul_est;
+    Data.base_rpy = Data.base_rpy;
     Data.base_omega_W = Data.omegaW_est;
-    Data.base_rot = Rrpy_woOff; // calculate by  eul_woOff
 
-    Data.q.block<3, 1>(0, 0) = Data.base_pos;
     Data.dq.block<3, 1>(0, 0) = Data.base_vel;
-
-    auto quatNow = eul2quat(Data.base_rpy[0], Data.base_rpy[1], Data.base_rpy[2]);
-    Data.q(3) = quatNow.x();
-    Data.q(4) = quatNow.y();
-    Data.q(5) = quatNow.z();
-    Data.q(6) = quatNow.w();
     Data.dq.block<3, 1>(3, 0) = Data.base_omega_W;
     //======================TEST EST===================
     Data.AX = A * X;

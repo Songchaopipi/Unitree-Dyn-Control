@@ -71,12 +71,6 @@ public:
     static double CzFun(double pz,double kp,double kn);
     static double erf(double xIn);
 
-
-//    //LowPass_filter vxLP,vyLP,vzLP;
-//    LowPass_filter_1O vxLP_1O{dt,50};
-//    LowPass_filter_1O vyLP_1O{dt,50};
-//    LowPass_filter_1O vzLP_1O{dt,50};
-
     Eul_W_filter eul_w_filter;
     double Eul_filtered[3],wL_filtered[3];
 
@@ -110,6 +104,25 @@ public:
     bool    legcontact[2]{false, false};
     double  FcontactUpp[2]{280, 280};
     double  FcontactLow[2]{10, 10};
+
+    double timeNow{0.0};
+    double left_contact_prob{1.0};
+    double right_contact_prob{1.0};
+    double left_contact_prob_lp{1.0};
+    double right_contact_prob_lp{1.0};
+    bool contact_kf_initialized{false};
+    Eigen::Matrix<double,15,15> Fk_contact, Qc_contact;
+    Eigen::Matrix<double,6,15> Hk_contact;
+    Eigen::Matrix<double,6,6> Rc_contact;
+    Eigen::Matrix<double,15,6> Kk_contact;
+    Eigen::Matrix<double,6,1> yk_contact;
+    Eigen::Matrix<double,15,1> contact_state;
+    Eigen::Matrix3d Renc_contact;
+    Eigen::Vector3d gravity_contact{0.0, 0.0, -9.81};
+
+    void initContactKf(const Eigen::Vector3d &plf, const Eigen::Vector3d &prf);
+    void predictContactKf(double leftProb, double rightProb);
+    void updateContactKf(const Eigen::Vector3d &plfEnc, const Eigen::Vector3d &prfEnc);
 };
 
 #endif //BIPED_STATEEST_STATEEST_H

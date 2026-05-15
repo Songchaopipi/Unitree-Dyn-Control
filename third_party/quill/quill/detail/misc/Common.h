@@ -6,6 +6,7 @@
 #pragma once
 
 #include "quill/TweakMe.h"
+#include <cstdint>
 #include <string>
 #include <sstream>
 

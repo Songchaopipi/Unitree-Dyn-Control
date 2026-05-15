@@ -1,0 +1,70 @@
+INPUT                   = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/include \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/bindings/python \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/README.md
+EXCLUDE                 = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css
+
+RECURSIVE               = YES
+
+FILE_PATTERNS           = *.cc *.cpp *.h *.hpp *.dox *.md *.py
+
+# Document members in declaration order
+SORT_MEMBER_DOCS        = NO
+SORT_BRIEF_DOCS         = NO
+SORT_MEMBERS_CTORS_1ST  = YES
+
+GENERATE_TESTLIST       = YES
+EXTRACT_STATIC          = YES
+DISABLE_INDEX           = NO
+FULL_SIDEBAR            = NO
+
+ENABLE_PREPROCESSING    = YES
+MACRO_EXPANSION         = YES
+EXPAND_ONLY_PREDEF      = YES
+PREDEFINED              += ALIGATOR_WITH_PINOCCHIO \
+                           ALIGATOR_MULTITHREADING
+
+FULL_PATH_NAMES         = YES
+EXCLUDE_SYMBOLS         = *::internal, *::detail, boost, fmt::*, std::*, xyz
+
+INCLUDE_PATH            = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/include
+
+EXCLUDE_SYMLINKS        = YES
+
+EXAMPLE_PATH            = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/examples \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc
+
+EXTRA_PACKAGES          = {bm,stmaryrd}
+FORMULA_MACROFILE       = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/macros.inc
+
+GENERATE_TREEVIEW       = YES
+
+VERBATIM_HEADERS        = YES
+
+
+HTML_EXTRA_STYLESHEET   = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome.css
+HTML_EXTRA_FILES        = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome-darkmode-toggle.js \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome-fragment-copy-button.js \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome-interactive-toc.js \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome-paragraph-link.js \
+                          /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/doc/doxygen-awesome-css/doxygen-awesome-tabs.js
+HTML_COLORSTYLE         = LIGHT
+
+SHOW_FILES              = YES
+SHOW_NAMESPACES         = YES
+
+USE_MATHJAX             = YES
+MATHJAX_VERSION         = MathJax_3
+MATHJAX_EXTENSIONS      = ams,boldsymbol
+# We shouldn't have to do this, instead insert empty relpath in CI for github pages
+MATHJAX_RELPATH         =
+
+SOURCE_BROWSER          = YES
+
+ALPHABETICAL_INDEX      = YES
+
+USE_MDFILE_AS_MAINPAGE  = /home/songchao/OPTControl_env/OpenLoong-Dyn-Control/third_party/aligator/README.md
+
+BUILTIN_STL_SUPPORT     = YES
+HAVE_DOT                = YES
+DOT_IMAGE_FORMAT        = SVG

@@ -41,6 +41,12 @@ Eigen::Matrix<double, 3, 3> Rz3(double theta);
 
 Eigen::Matrix<double, 3, 3> CrossProduct_A(Eigen::Matrix<double, 3, 1> A);
 
+Eigen::Matrix3d skewSymmetric(const Eigen::Vector3d &v);
+
+double wrapToPi(double angle);
+
+double vectorValueOrDefault(const Eigen::VectorXd &values, int index, double fallback = 0.0);
+
 double Ramp(double u, double tgt, double inc);
 
 void Limit(double &data, double max, double min);

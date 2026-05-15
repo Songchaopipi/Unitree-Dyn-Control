@@ -70,6 +70,7 @@ void PVT_Ctr::setJointPD(double kp, double kd, const char *jointName) {
         id = std::distance(motorName.begin(), it);
     } else {
         std::cout << jointName << " NOT found!" << std::endl;
+        return;
     }
     pvt_Kp[id]=kp;
     pvt_Kd[id]=kd;

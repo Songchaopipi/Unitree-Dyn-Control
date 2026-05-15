@@ -7,6 +7,8 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 */
 #include "GLFW_callbacks.h"
 
+#include <cstdlib>
+
 UIctr::UIctr(mjModel *modelIn, mjData *dataIn) {
     mj_model=modelIn;
     mj_data=dataIn;
@@ -49,7 +51,7 @@ void UIctr::iniGLFW() {
 }
 
 // create window, make OpenGL context current, request v-sync, adjust view, bond callbacks, etc.
-void UIctr::createWindow(const char* windowTitle, bool saveVideo) {
+void UIctr::createWindow(const char* windowTitle, bool saveVideo, const char *videoPath) {
     window=glfwCreateWindow(width, height, windowTitle, NULL, NULL);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -95,7 +97,7 @@ void UIctr::createWindow(const char* windowTitle, bool saveVideo) {
         image_depth_ = (float*)malloc(sizeof(float)*width*height);
 
         // create output rgb file
-        file = fopen("../record/rgbRec.out", "wb");
+        file = fopen(videoPath, "wb");
         if( !file )
             mju_error("Could not open rgbfile for writing");
     }
@@ -254,6 +256,16 @@ void UIctr::Scroll(double xoffset, double yoffset)
 }
 
 void UIctr::Close() {
+    if (file)
+    {
+        fclose(file);
+        file = nullptr;
+    }
+    free(image_rgb_);
+    image_rgb_ = nullptr;
+    free(image_depth_);
+    image_depth_ = nullptr;
+
     // Free mujoco objects
     mj_deleteData(mj_data);
     mj_deleteModel(mj_model);

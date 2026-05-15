@@ -30,7 +30,6 @@ MJ_Interface::MJ_Interface(mjModel *mj_modelIn, mjData *mj_dataIn)
         jntId_qpos[i] = mj_model->jnt_qposadr[tmpId];
         jntId_qvel[i] = mj_model->jnt_dofadr[tmpId];
         std::string motorName = JointName[i];
-        motorName = "M" + motorName.substr(1);
         tmpId = mj_name2id(mj_model, mjOBJ_ACTUATOR, motorName.c_str());
         if (tmpId == -1)
         {
@@ -44,10 +43,19 @@ MJ_Interface::MJ_Interface(mjModel *mj_modelIn, mjData *mj_dataIn)
     //    mjtNum sensor_data[dim];
     //    mju_copy(sensor_data, &d->sensordata[adr], dim);
     baseBodyId = mj_name2id(mj_model, mjOBJ_BODY, baseName.c_str());
+    floorGeomId = mj_name2id(mj_model, mjOBJ_GEOM, "floor");
+    leftFootBodyId = mj_name2id(mj_model, mjOBJ_BODY, "left_ankle_roll_link");
+    rightFootBodyId = mj_name2id(mj_model, mjOBJ_BODY, "right_ankle_roll_link");
     orientataionSensorId = mj_name2id(mj_model, mjOBJ_SENSOR, orientationSensorName.c_str());
-    velSensorId = mj_name2id(mj_model, mjOBJ_SENSOR, velSensorName.c_str());
+    velSensorId = velSensorName.empty() ? -1 : mj_name2id(mj_model, mjOBJ_SENSOR, velSensorName.c_str());
     gyroSensorId = mj_name2id(mj_model, mjOBJ_SENSOR, gyroSensorName.c_str());
     accSensorId = mj_name2id(mj_model, mjOBJ_SENSOR, accSensorName.c_str());
+    if (baseBodyId == -1 || floorGeomId == -1 || leftFootBodyId == -1 || rightFootBodyId == -1 ||
+        orientataionSensorId == -1 || gyroSensorId == -1 || accSensorId == -1)
+    {
+        std::cerr << "G1 MuJoCo base, foot contact body, floor geom or IMU sensors were not found in the XML file!" << std::endl;
+        std::terminate();
+    }
 }
 
 void MJ_Interface::updateSensorValues()
@@ -86,13 +94,73 @@ void MJ_Interface::updateSensorValues()
         baseAcc[i] = mj_data->sensordata[mj_model->sensor_adr[accSensorId] + i];
         baseAngVel[i] = mj_data->sensordata[mj_model->sensor_adr[gyroSensorId] + i];
         baseLinVel[i] = (basePos[i] - posOld) / (mj_model->opt.timestep);
+        f3d[i][0] = 0.0;
+        f3d[i][1] = 0.0;
+    }
+
+    for (int i = 0; i < mj_data->ncon; ++i)
+    {
+        const mjContact &contact = mj_data->contact[i];
+        int footCol = -1;
+        int sign = 1;
+        for (int side = 0; side < 2; ++side)
+        {
+            const int geomId = contact.geom[side];
+            const int otherGeomId = contact.geom[1 - side];
+            const int bodyId = mj_model->geom_bodyid[geomId];
+            if (otherGeomId == floorGeomId && bodyId == leftFootBodyId)
+            {
+                footCol = 0;
+                sign = (side == 0) ? 1 : -1;
+            }
+            else if (otherGeomId == floorGeomId && bodyId == rightFootBodyId)
+            {
+                footCol = 1;
+                sign = (side == 0) ? 1 : -1;
+            }
+        }
+        if (footCol < 0)
+        {
+            continue;
+        }
+
+        mjtNum contactForceLocal[6];
+        mj_contactForce(mj_model, mj_data, i, contactForceLocal);
+        Eigen::Vector3d forceLocal(contactForceLocal[0], contactForceLocal[1], contactForceLocal[2]);
+        Eigen::Matrix3d contactFrame;
+        for (int r = 0; r < 3; ++r)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                contactFrame(r, c) = contact.frame[3 * r + c];
+            }
+        }
+        const Eigen::Vector3d forceWorld = -sign * contactFrame.transpose() * forceLocal;
+        for (int k = 0; k < 3; ++k)
+        {
+            f3d[k][footCol] += forceWorld(k);
+        }
     }
 }
 
 void MJ_Interface::setMotorsTorque(std::vector<double> &tauIn)
 {
     for (int i = 0; i < jointNum; i++)
-        mj_data->ctrl[i] = tauIn.at(i);
+        mj_data->ctrl[jntId_dctl[i]] = tauIn.at(i);
+}
+
+void MJ_Interface::setMotorsPosition(const std::vector<double> &qIn)
+{
+    for (int i = 0; i < jointNum && i < static_cast<int>(qIn.size()); i++)
+    {
+        mj_data->qpos[jntId_qpos[i]] = qIn.at(i);
+    }
+    for (int i = 0; i < mj_model->nv; ++i)
+    {
+        mj_data->qvel[i] = 0.0;
+    }
+    mj_forward(mj_model, mj_data);
+    updateSensorValues();
 }
 
 void MJ_Interface::dataBusWrite(DataBus &busIn)
@@ -108,12 +176,12 @@ void MJ_Interface::dataBusWrite(DataBus &busIn)
     busIn.fR[0] = f3d[0][1];
     busIn.fR[1] = f3d[1][1];
     busIn.fR[2] = f3d[2][1];
-    // busIn.basePos[0] = basePos[0];
-    // busIn.basePos[1] = basePos[1];
-    // busIn.basePos[2] = basePos[2];
-    // busIn.baseLinVel[0] = baseLinVel[0];
-    // busIn.baseLinVel[1] = baseLinVel[1];
-    // busIn.baseLinVel[2] = baseLinVel[2];
+    busIn.basePos[0] = basePos[0];
+    busIn.basePos[1] = basePos[1];
+    busIn.basePos[2] = basePos[2];
+    busIn.baseLinVel[0] = baseLinVel[0];
+    busIn.baseLinVel[1] = baseLinVel[1];
+    busIn.baseLinVel[2] = baseLinVel[2];
     busIn.baseAcc[0] = baseAcc[0];
     busIn.baseAcc[1] = baseAcc[1];
     busIn.baseAcc[2] = baseAcc[2];

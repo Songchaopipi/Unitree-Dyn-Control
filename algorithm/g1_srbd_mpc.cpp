@@ -1,0 +1,329 @@
+#include "g1_srbd_mpc.h"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include "pino_kin_dyn.h"
+#include "useful_math.h"
+
+namespace
+{
+constexpr double kGravity = 9.80665;
+constexpr double kInf = 1e10;
+
+Eigen::Matrix3d skew(const Eigen::Vector3d &v)
+{
+    Eigen::Matrix3d S;
+    S << 0.0, -v.z(), v.y(),
+        v.z(), 0.0, -v.x(),
+        -v.y(), v.x(), 0.0;
+    return S;
+}
+
+Eigen::Matrix3d quatToMat(const Eigen::Quaterniond &qIn)
+{
+    Eigen::Quaterniond q = qIn.normalized();
+    if (!q.coeffs().allFinite() || q.norm() < 1e-8)
+    {
+        return Eigen::Matrix3d::Identity();
+    }
+    return q.toRotationMatrix();
+}
+
+Eigen::Quaterniond quatFromQ(const Eigen::VectorXd &q)
+{
+    if (q.size() < 7)
+    {
+        return Eigen::Quaterniond::Identity();
+    }
+    return Eigen::Quaterniond(q(6), q(3), q(4), q(5));
+}
+
+Eigen::Vector3d vectorFromArray(const double value[3])
+{
+    return Eigen::Vector3d(value[0], value[1], value[2]);
+}
+} // namespace
+
+G1SrbdMpc::G1SrbdMpc(int horizon, double dt)
+{
+    horizon_ = std::max(1, horizon);
+    dt_ = std::max(1e-4, dt);
+}
+
+bool G1SrbdMpc::solveFromDataBus(const DataBus &robotState, double mass, const Eigen::Matrix3d &inertiaBody)
+{
+    return solve(buildInputFromDataBus(robotState, mass, inertiaBody));
+}
+
+G1SrbdMpc::Input G1SrbdMpc::buildInputFromDataBus(const DataBus &robotState,
+                                                   double mass,
+                                                   const Eigen::Matrix3d &inertiaBody) const
+{
+    Input input;
+    input.mass = std::max(1.0, mass);
+    input.inertiaBody = inertiaBody.allFinite() ? inertiaBody : Eigen::Matrix3d::Identity();
+    input.orientation = quatFromQ(robotState.q);
+    input.current << robotState.base_rpy.x(), robotState.base_rpy.y(), robotState.base_rpy.z(),
+        robotState.pCoM_W.x(), robotState.pCoM_W.y(), robotState.pCoM_W.z(),
+        robotState.base_omega_W.x(), robotState.base_omega_W.y(), robotState.base_omega_W.z(),
+        robotState.dq(0), robotState.dq(1), robotState.dq(2), kGravity;
+    input.contactPositionWorld = {robotState.fe_l_pos_W, robotState.fe_r_pos_W};
+    input.reference.resize(13, horizon_);
+    input.contactTable.resize(horizon_, 2);
+
+    Eigen::Vector3d desiredVel = Eigen::Vector3d::Zero();
+    if (robotState.motionState == DataBus::Walk)
+    {
+        desiredVel = robotState.desV_W;
+    }
+    else if (robotState.centroidal_nmpc_enabled)
+    {
+        desiredVel = robotState.centroidal_nmpc_com_vel_des;
+    }
+    Eigen::Vector3d refCom = robotState.pCoM_W;
+    if (robotState.motionState == DataBus::Walk)
+    {
+        const double supportZ =
+            robotState.walk_is_double_support ? 0.5 * (robotState.fe_l_pos_W.z() + robotState.fe_r_pos_W.z()) :
+                                                robotState.stance_fe_pos_cur_W.z();
+        refCom.z() = supportZ + robotState.walk_target_com_height;
+    }
+    else if (robotState.centroidal_nmpc_enabled)
+    {
+        refCom = robotState.centroidal_nmpc_com_pos_des;
+    }
+
+    for (int k = 0; k < horizon_; ++k)
+    {
+        input.contactTable(k, 0) = (robotState.motionState == DataBus::Stand || robotState.walk_left_contact) ? 1 : 0;
+        input.contactTable(k, 1) = (robotState.motionState == DataBus::Stand || robotState.walk_right_contact) ? 1 : 0;
+        const Eigen::Vector3d pRef = refCom + static_cast<double>(k + 1) * dt_ * desiredVel;
+        input.reference.col(k) << 0.0, 0.0, robotState.walk_target_yaw,
+            pRef.x(), pRef.y(), pRef.z(),
+            0.0, 0.0, robotState.walk_target_yaw_rate,
+            desiredVel.x(), desiredVel.y(), desiredVel.z(),
+            kGravity;
+    }
+    return input;
+}
+
+void G1SrbdMpc::buildDiscreteModel(const Input &input,
+                                   int knot,
+                                   Eigen::Matrix<double, 13, 13> &A,
+                                   Eigen::Matrix<double, 13, 12> &B) const
+{
+    A.setIdentity();
+    B.setZero();
+
+    const Eigen::Matrix3d R = quatToMat(input.orientation);
+    const Eigen::Matrix3d IWorld = R * input.inertiaBody * R.transpose();
+    const Eigen::Matrix3d IInv = IWorld.inverse();
+    const Eigen::Matrix<double, 6, 6> HContact = g1_kin_dyn::planeForceToWrenchMap();
+
+    Eigen::Matrix<double, 13, 13> Ac = Eigen::Matrix<double, 13, 13>::Zero();
+    Ac.block<3, 3>(0, 6) = Rz3(input.current(2));
+    Ac.block<3, 3>(3, 9).setIdentity();
+    Ac(11, 12) = -1.0;
+
+    Eigen::Matrix<double, 13, 12> Bc = Eigen::Matrix<double, 13, 12>::Zero();
+    Eigen::Vector3d com = input.current.segment<3>(3);
+    if (input.reference.cols() > knot)
+    {
+        com = input.reference.col(knot).segment<3>(3);
+    }
+    const std::array<Eigen::Vector3d, 2> *contactPositions = &input.contactPositionWorld;
+    if (static_cast<int>(input.contactPositionWorldHorizon.size()) > knot)
+    {
+        contactPositions = &input.contactPositionWorldHorizon[knot];
+    }
+    for (int leg = 0; leg < 2; ++leg)
+    {
+        const Eigen::Vector3d r = (*contactPositions)[leg] - com;
+        Eigen::Matrix<double, 6, 6> G = Eigen::Matrix<double, 6, 6>::Zero();
+        G.block<3, 3>(0, 0).setIdentity();
+        G.block<3, 3>(3, 0) = skew(r);
+        G.block<3, 3>(3, 3).setIdentity();
+
+        Eigen::Matrix<double, 6, 6> planeToCentroidal = G * HContact;
+        Bc.block(9, 6 * leg, 3, 6) = planeToCentroidal.topRows<3>() / input.mass;
+        Bc.block(6, 6 * leg, 3, 6) = IInv * planeToCentroidal.bottomRows<3>();
+    }
+
+    A += dt_ * Ac;
+    B = dt_ * Bc;
+}
+
+bool G1SrbdMpc::solve(const Input &input)
+{
+    firstPlaneForces_.setZero();
+    firstWrenches_.setZero();
+    qpStatus_ = -1;
+
+    if (input.reference.cols() != horizon_ || input.contactTable.rows() != horizon_)
+    {
+        return false;
+    }
+
+    const int nx = 13;
+    const int nu = 12;
+    const int nVar = nu * horizon_;
+    const int nState = nx * horizon_;
+    const int coneRowsPerFoot = 11;
+    const int forceBoundRowsPerFoot = 6;
+    const int rowsPerFoot = coneRowsPerFoot + forceBoundRowsPerFoot;
+    const int rowsPerKnot = 2 * rowsPerFoot;
+    const int nCon = rowsPerKnot * horizon_;
+
+    Eigen::MatrixXd Aqp = Eigen::MatrixXd::Zero(nState, nx);
+    Eigen::MatrixXd Bqp = Eigen::MatrixXd::Zero(nState, nVar);
+    Eigen::Matrix<double, 13, 13> Apow = Eigen::Matrix<double, 13, 13>::Identity();
+    std::vector<Eigen::Matrix<double, 13, 13>> AdList(horizon_);
+    std::vector<Eigen::Matrix<double, 13, 12>> BdList(horizon_);
+    for (int i = 0; i < horizon_; ++i)
+    {
+        buildDiscreteModel(input, i, AdList[i], BdList[i]);
+        Apow = AdList[i] * Apow;
+        Aqp.block(i * nx, 0, nx, nx) = Apow;
+        Eigen::Matrix<double, 13, 13> Aij = Eigen::Matrix<double, 13, 13>::Identity();
+        for (int j = i; j >= 0; --j)
+        {
+            Bqp.block(i * nx, j * nu, nx, nu) = Aij * BdList[j];
+            Aij = Aij * AdList[j];
+        }
+    }
+
+    Eigen::VectorXd x0 = input.current;
+    Eigen::VectorXd xd = Eigen::VectorXd::Zero(nState);
+    for (int k = 0; k < horizon_; ++k)
+    {
+        xd.segment(k * nx, nx) = input.reference.col(k);
+    }
+
+    Eigen::Matrix<double, 13, 1> stateWeights;
+    stateWeights << 80.0, 80.0, 120.0,
+        120.0, 120.0, 220.0,
+        1.0, 1.0, 4.0,
+        40.0, 40.0, 20.0,
+        0.0;
+    Eigen::Matrix<double, 12, 1> inputWeights;
+    inputWeights << 1e-4, 1e-4, 2e-4, 1e-4, 1e-4, 2e-4,
+        1e-4, 1e-4, 2e-4, 1e-4, 1e-4, 2e-4;
+    Eigen::VectorXd uNom = Eigen::VectorXd::Zero(nVar);
+    for (int k = 0; k < horizon_; ++k)
+    {
+        int activeContacts = 0;
+        for (int leg = 0; leg < 2; ++leg)
+        {
+            activeContacts += input.contactTable(k, leg) != 0 ? 1 : 0;
+        }
+        if (activeContacts == 0)
+        {
+            continue;
+        }
+        const double nominalFz = input.mass * kGravity / static_cast<double>(activeContacts);
+        for (int leg = 0; leg < 2; ++leg)
+        {
+            if (input.contactTable(k, leg) != 0)
+            {
+                uNom.segment<6>(k * nu + 6 * leg) =
+                    g1_kin_dyn::distributeVerticalFootLoad(nominalFz);
+            }
+        }
+    }
+
+    Eigen::VectorXd Wdiag = stateWeights.replicate(horizon_, 1);
+    Eigen::VectorXd Rdiag = inputWeights.replicate(horizon_, 1);
+    Eigen::MatrixXd H = 2.0 * (Bqp.transpose() * Wdiag.asDiagonal() * Bqp);
+    H.diagonal() += 2.0 * Rdiag;
+    H.diagonal().array() += 2.0 * nominalForceWeight;
+    Eigen::VectorXd g = 2.0 * Bqp.transpose() * Wdiag.asDiagonal() * (Aqp * x0 - xd) -
+                        2.0 * nominalForceWeight * uNom;
+    H.diagonal().array() += 1e-8;
+
+    Eigen::MatrixXd Acon = Eigen::MatrixXd::Zero(nCon, nVar);
+    Eigen::VectorXd lb = Eigen::VectorXd::Constant(nCon, -kInf);
+    Eigen::VectorXd ub = Eigen::VectorXd::Zero(nCon);
+    const Eigen::Matrix<double, 11, 6> cone =
+        g1_kin_dyn::roMoCoPlaneFootCone(mu, footHalfWidth, footFront, footBack, yawFriction);
+    for (int k = 0; k < horizon_; ++k)
+    {
+        for (int leg = 0; leg < 2; ++leg)
+        {
+            const int row = k * rowsPerKnot + leg * rowsPerFoot;
+            const int col = k * nu + leg * 6;
+            Acon.block(row, col, coneRowsPerFoot, 6) = cone;
+            const bool contact = input.contactTable(k, leg) != 0;
+            ub.segment(row, coneRowsPerFoot).setZero();
+            ub(row) = contact ? -fzLow : 0.0;
+            const int forceBoundRow = row + coneRowsPerFoot;
+            for (int j = 0; j < 6; ++j)
+            {
+                Acon(forceBoundRow + j, col + j) = 1.0;
+                lb(forceBoundRow + j) = contact ? -fMax : 0.0;
+                ub(forceBoundRow + j) = contact ? fMax : 0.0;
+            }
+        }
+    }
+
+    std::vector<qpOASES::real_t> qpH(nVar * nVar), qpg(nVar), qpA(nCon * nVar), qplbA(nCon), qpubA(nCon);
+    copyEigenToReal(qpH.data(), H);
+    copyEigenToReal(qpg.data(), g);
+    copyEigenToReal(qpA.data(), Acon);
+    copyEigenToReal(qplbA.data(), lb);
+    copyEigenToReal(qpubA.data(), ub);
+
+    qpOASES::QProblem prob(nVar, nCon);
+    qpOASES::Options options;
+    options.setToMPC();
+    options.printLevel = qpOASES::PL_NONE;
+    prob.setOptions(options);
+    qpOASES::int_t nWSR = 300;
+    qpOASES::real_t cpuTime = dt_;
+    const qpOASES::returnValue res =
+        prob.init(qpH.data(), qpg.data(), qpA.data(), nullptr, nullptr,
+                  qplbA.data(), qpubA.data(), nWSR, &cpuTime);
+    qpStatus_ = qpOASES::getSimpleStatus(res);
+    if (res != qpOASES::SUCCESSFUL_RETURN)
+    {
+        return false;
+    }
+
+    std::vector<qpOASES::real_t> sol(nVar, 0.0);
+    prob.getPrimalSolution(sol.data());
+    for (int i = 0; i < 12; ++i)
+    {
+        firstPlaneForces_(i) = sol[i];
+    }
+    const Eigen::Matrix<double, 6, 6> HContact = g1_kin_dyn::planeForceToWrenchMap();
+    firstWrenches_.segment<6>(0) = HContact * firstPlaneForces_.segment<6>(0);
+    firstWrenches_.segment<6>(6) = HContact * firstPlaneForces_.segment<6>(6);
+    return firstPlaneForces_.allFinite();
+}
+
+void G1SrbdMpc::dataBusWrite(DataBus &robotState) const
+{
+    robotState.Fr_ff = firstWrenches_;
+    robotState.qpStatus_MPC = qpStatus_;
+}
+
+void G1SrbdMpc::copyEigenToReal(qpOASES::real_t *target, const Eigen::MatrixXd &source) const
+{
+    int count = 0;
+    for (int i = 0; i < source.rows(); ++i)
+    {
+        for (int j = 0; j < source.cols(); ++j)
+        {
+            target[count++] = std::isfinite(source(i, j)) ? source(i, j) : 0.0;
+        }
+    }
+}
+
+void G1SrbdMpc::copyEigenToReal(qpOASES::real_t *target, const Eigen::VectorXd &source) const
+{
+    for (int i = 0; i < source.size(); ++i)
+    {
+        target[i] = std::isfinite(source(i)) ? source(i) : 0.0;
+    }
+}

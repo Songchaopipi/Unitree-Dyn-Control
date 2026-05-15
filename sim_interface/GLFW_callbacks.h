@@ -7,6 +7,9 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 */
 #pragma once
 #include <mujoco/mujoco.h>
+#ifndef GLFW_INCLUDE_NONE
+#define GLFW_INCLUDE_NONE
+#endif
 #include <GLFW/glfw3.h>
 #include <string>
 #include <memory>
@@ -39,7 +42,7 @@ public:
 
     UIctr(mjModel *modelIn, mjData *dataIn);
     void iniGLFW();
-    void createWindow(const char * windowTitle, bool saveVideo);
+    void createWindow(const char * windowTitle, bool saveVideo, const char *videoPath = "../record/rgbRec.out");
     void updateScene();
 
     // keyboard callback
@@ -61,10 +64,10 @@ public:
 
 
 private:
-    unsigned char* image_rgb_;
-    float* image_depth_;
+    unsigned char* image_rgb_{nullptr};
+    float* image_depth_{nullptr};
 
-    FILE* file;
+    FILE* file{nullptr};
 
     int width{1200};
     int height{800};
@@ -77,5 +80,3 @@ private:
     mjvScene scn;                       // abstract scene
     mjrContext con;                     // custom GPU context
 };
-
-

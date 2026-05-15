@@ -24,6 +24,7 @@ public:
     Eigen::Vector3d tau_upp_stand_L, tau_low_stand_L; // foot end contact torque limit for stand state, in body frame
     Eigen::Vector3d tau_upp_walk_L, tau_low_walk_L;  // foot end contact torque limit for walk state, in body frame
     double f_z_low{0},f_z_upp{0};
+    double foot_l_front{0.1}, foot_l_back{-0.04}, foot_half_width{0.025}, foot_yaw_friction{0.046};
     DataBus::LegState legStateCur;
     DataBus::MotionState motionStateCur;
     WBC_priority(int model_nv_In, int QP_nvIn, int QP_ncIn, double miu_In, double dt);
@@ -31,6 +32,7 @@ public:
     Eigen::MatrixXd dyn_M, dyn_M_inv, dyn_Ag, dyn_dAg;
     Eigen::VectorXd dyn_Non; // dyn_Non= c*dq+g
     Eigen::MatrixXd Jc, dJc, Jfe, dJfe, Jfe_L, Jfe_R;
+    Eigen::MatrixXd Jc_foot, dJc_foot, Jfe_foot, dJfe_foot;
     Eigen::MatrixXd J_hd_l, J_hd_r, dJ_hd_l, dJ_hd_r;
     Eigen::MatrixXd Jsw, dJsw;
     Eigen::Matrix3d fe_rot_sw_W;
@@ -55,6 +57,7 @@ public:
     double l_shoulder_pitch = 0; //q(28) - qIniDes(28);
     double r_shoulder_pitch = 0; //q(34) - qIniDes(34);
     Eigen::Vector3d pCoMDes, pCoMCur;
+    bool pCoMDesInitialized{false};
 
     PriorityTasks kin_tasks_walk, kin_tasks_stand;
     void setQini(const Eigen::VectorXd &qIniDes, const Eigen::VectorXd &qIniCur);
@@ -75,6 +78,7 @@ private:
     int QP_nc;
     void copy_Eigen_to_real_t(qpOASES::real_t* target, const Eigen::MatrixXd &source, int nRows, int nCols);
     Eigen::MatrixXd J_base, dJ_base, Jcom;
+    Eigen::Vector3d dJcom;
     Eigen::MatrixXd J_hip_link;
     Eigen::Vector3d base_pos_des, base_pos, base_rpy_des, base_rpy_cur, hip_link_pos;
     Eigen::Matrix3d hip_link_rot, base_rot;
@@ -83,10 +87,13 @@ private:
     Eigen::Matrix3d stance_fe_rot_cur_W;
     Eigen::Vector3d stanceDesPos_W;
     Eigen::VectorXd des_ddq, des_dq, des_delta_q, des_q;
+    Eigen::VectorXd walk_yd, walk_dyd, walk_d2yd;
+    double walk_target_yaw{0.0};
+    double walk_target_yaw_rate{0.0};
     Eigen::VectorXd qIniDes, qIniCur;
 
     static const int QP_nv_des=18;
-    static const int QP_nc_des=22;
+    static const int QP_nc_des=34;
 
     qpOASES::real_t qp_H[QP_nv_des*QP_nv_des];
     qpOASES::real_t qp_A[QP_nc_des*QP_nv_des];
@@ -95,5 +102,3 @@ private:
     qpOASES::real_t qp_ubA[QP_nc_des];
     qpOASES::real_t xOpt_iniGuess[QP_nv_des];
 };
-
-
