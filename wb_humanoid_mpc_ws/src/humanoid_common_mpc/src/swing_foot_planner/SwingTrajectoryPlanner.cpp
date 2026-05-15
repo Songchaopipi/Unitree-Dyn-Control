@@ -1,0 +1,342 @@
+/******************************************************************************
+Copyright (c) 2025, Manuel Yves Galliker. All rights reserved.
+Copyright (c) 2024, 1X Technologies. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+******************************************************************************/
+
+// 自动中文注释：src/humanoid_common_mpc/src/swing_foot_planner/SwingTrajectoryPlanner.cpp 用于本工程 MPC/仿真链路，下面变量和函数均按用途补充中文说明。
+#include <boost/property_tree/info_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+
+#include "humanoid_common_mpc/swing_foot_planner/SwingTrajectoryPlanner.h"
+
+#include <ocs2_core/misc/Lookup.h>
+
+#include "humanoid_common_mpc/gait/MotionPhaseDefinition.h"
+
+namespace ocs2::humanoid {
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+SwingTrajectoryPlanner::SwingTrajectoryPlanner(Config config, size_t numFeet) : config_(std::move(config)), numFeet_(numFeet) {}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+scalar_t SwingTrajectoryPlanner::getZaccelerationConstraint(size_t leg, scalar_t time) const {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const auto index = lookup::findIndexInTimeArray(feetHeightTrajectoriesEvents_[leg], time);  // 变量说明：index 表示索引。
+  return feetHeightTrajectories_[leg][index].acceleration(time);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+scalar_t SwingTrajectoryPlanner::getZvelocityConstraint(size_t leg, scalar_t time) const {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const auto index = lookup::findIndexInTimeArray(feetHeightTrajectoriesEvents_[leg], time);  // 变量说明：index 表示索引。
+  return feetHeightTrajectories_[leg][index].velocity(time);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+scalar_t SwingTrajectoryPlanner::getZpositionConstraint(size_t leg, scalar_t time) const {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const auto index = lookup::findIndexInTimeArray(feetHeightTrajectoriesEvents_[leg], time);  // 变量说明：index 表示索引。
+  return feetHeightTrajectories_[leg][index].position(time);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+scalar_t SwingTrajectoryPlanner::getImpactProximityFactor(size_t leg, scalar_t time) const {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const auto index = lookup::findIndexInTimeArray(feetHeightTrajectoriesEvents_[leg], time);  // 变量说明：index 表示索引。
+  return impactProximityTrajectories_[leg][index].position(time);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+void SwingTrajectoryPlanner::update(const ModeSchedule& modeSchedule, scalar_t terrainHeight) {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const scalar_array_t terrainHeightSequence(modeSchedule.modeSequence.size(), terrainHeight);
+  const scalar_array_t touchDownTerrainHeightSequence(modeSchedule.modeSequence.size(), terrainHeight + config_.touchDownHeightOffset);
+  feet_array_t<scalar_array_t> liftOffHeightSequence;  // 变量说明：liftOffHeightSequence 表示lift、off、height、sequence。
+  liftOffHeightSequence.fill(terrainHeightSequence);
+  feet_array_t<scalar_array_t> touchDownHeightSequence;  // 变量说明：touchDownHeightSequence 表示touch、down、height、sequence。
+  touchDownHeightSequence.fill(touchDownTerrainHeightSequence);
+  update(modeSchedule, liftOffHeightSequence, touchDownHeightSequence);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+void SwingTrajectoryPlanner::update(const ModeSchedule& modeSchedule,  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+                                    const feet_array_t<scalar_array_t>& liftOffHeightSequence,  // 变量说明：liftOffHeightSequence 表示lift、off、height、sequence。
+                                    const feet_array_t<scalar_array_t>& touchDownHeightSequence) {  // 变量说明：touchDownHeightSequence 表示touch、down、height、sequence。
+  const auto& modeSequence = modeSchedule.modeSequence;  // 变量说明：modeSequence 表示接触模式、sequence。
+  const auto& eventTimes = modeSchedule.eventTimes;  // 变量说明：eventTimes 表示事件、times。
+
+  const auto eesContactFlagStocks = extractContactFlags(modeSequence);  // 变量说明：eesContactFlagStocks 表示ees、接触、flag、stocks。
+
+  feet_array_t<std::vector<int>> startTimesIndices;  // 变量说明：startTimesIndices 表示start、times、indices。
+  feet_array_t<std::vector<int>> finalTimesIndices;  // 变量说明：finalTimesIndices 表示最终、times、indices。
+  for (size_t leg = 0; leg < numFeet_; leg++) {
+    std::tie(startTimesIndices[leg], finalTimesIndices[leg]) = updateFootSchedule(eesContactFlagStocks[leg]);
+  }
+
+  for (size_t j = 0; j < numFeet_; j++) {
+    feetHeightTrajectories_[j].clear();
+    feetHeightTrajectories_[j].reserve(modeSequence.size());
+    impactProximityTrajectories_[j].clear();
+    impactProximityTrajectories_[j].reserve(modeSequence.size());
+    for (int p = 0; p < modeSequence.size(); ++p) {
+      const int swingStartIndex = startTimesIndices[j][p];  // 变量说明：swingStartIndex 表示摆动脚、start、索引。
+      const int swingFinalIndex = finalTimesIndices[j][p];  // 变量说明：swingFinalIndex 表示摆动脚、最终、索引。
+      checkThatIndicesAreValid(j, p, swingStartIndex, swingFinalIndex, modeSequence);
+
+      const scalar_t swingStartTime = eventTimes[swingStartIndex];  // 变量说明：swingStartTime 表示摆动脚、start、时间。
+      const scalar_t swingFinalTime = eventTimes[swingFinalIndex];  // 变量说明：swingFinalTime 表示摆动脚、最终、时间。
+
+      if (!eesContactFlagStocks[j][p]) {
+        const scalar_t scaling = swingTrajectoryScaling(swingStartTime, swingFinalTime, config_.swingTimeScale);  // for leg in the air
+        if (eesContactFlagStocks[j][p - 1] && eesContactFlagStocks[j][p + 1]) {  // For a swing leg, only in the air for current mode
+
+          const CubicSpline::Node liftOffHeight{swingStartTime, liftOffHeightSequence[j][p], scaling * config_.liftOffVelocity};  // 变量说明：liftOffHeight 表示lift、off、height。
+          const CubicSpline::Node touchDownHeight{swingFinalTime, touchDownHeightSequence[j][p], scaling * config_.touchDownVelocity};  // 变量说明：touchDownHeight 表示touch、down、height。
+          const scalar_t midHeight = std::min(liftOffHeightSequence[j][p], touchDownHeightSequence[j][p]) + scaling * config_.swingHeight;  // 变量说明：midHeight 表示mid、height。
+          feetHeightTrajectories_[j].emplace_back(liftOffHeight, midHeight, touchDownHeight);
+
+          const CubicSpline::Node impactProximityLiftOff{swingStartTime, 1.0, scaling * config_.impactProximityFactorLiftOffVelocity};  // 变量说明：impactProximityLiftOff 表示impact、proximity、lift、off。
+          const CubicSpline::Node impactProximityTouchDown{swingFinalTime, 1.0, scaling * config_.impactProximityFactorTouchDownVelocity};  // 变量说明：impactProximityTouchDown 表示impact、proximity、touch、down。
+
+          impactProximityTrajectories_[j].emplace_back(impactProximityLiftOff, config_.impactProximityFactorMidPointValue,
+                                                       impactProximityTouchDown);
+        } else if (eesContactFlagStocks[j][p - 1]) {  // For foot just leaving the ground and staying in the air
+          const scalar_t midHeight = liftOffHeightSequence[j][p] + config_.swingHeight;  // 变量说明：midHeight 表示mid、height。
+          const CubicSpline::Node liftOffHeight{swingStartTime, liftOffHeightSequence[j][p], config_.liftOffVelocity};  // 变量说明：liftOffHeight 表示lift、off、height。
+          const CubicSpline::Node touchDownHeight{swingFinalTime, midHeight, 0.0};  // 变量说明：touchDownHeight 表示touch、down、height。
+          feetHeightTrajectories_[j].emplace_back(liftOffHeight, midHeight, touchDownHeight);
+
+          const CubicSpline::Node impactProximityLiftOff{swingStartTime, 1.0, config_.impactProximityFactorLiftOffVelocity};  // 变量说明：impactProximityLiftOff 表示impact、proximity、lift、off。
+          const CubicSpline::Node impactProximityTouchDown{swingFinalTime, config_.impactProximityFactorMidPointValue, 0.0};  // 变量说明：impactProximityTouchDown 表示impact、proximity、touch、down。
+
+          impactProximityTrajectories_[j].emplace_back(impactProximityLiftOff, config_.impactProximityFactorMidPointValue,
+                                                       impactProximityTouchDown);
+        } else if (eesContactFlagStocks[j][p + 1]) {  // For foot that was in the air and is impacting in the next mode
+          const scalar_t midHeight = touchDownHeightSequence[j][p] + config_.swingHeight;  // 变量说明：midHeight 表示mid、height。
+          const CubicSpline::Node liftOffHeight{swingStartTime, midHeight, 0.0};  // 变量说明：liftOffHeight 表示lift、off、height。
+          const CubicSpline::Node touchDownHeight{swingFinalTime, touchDownHeightSequence[j][p], config_.touchDownVelocity};  // 变量说明：touchDownHeight 表示touch、down、height。
+          feetHeightTrajectories_[j].emplace_back(liftOffHeight, midHeight, touchDownHeight);
+
+          const CubicSpline::Node impactProximityLiftOff{swingStartTime, config_.impactProximityFactorMidPointValue, 0.0};  // 变量说明：impactProximityLiftOff 表示impact、proximity、lift、off。
+          const CubicSpline::Node impactProximityTouchDown{swingFinalTime, 1.0, config_.impactProximityFactorTouchDownVelocity};  // 变量说明：impactProximityTouchDown 表示impact、proximity、touch、down。
+
+          impactProximityTrajectories_[j].emplace_back(impactProximityLiftOff, config_.impactProximityFactorMidPointValue,
+                                                       impactProximityTouchDown);
+        } else {  // For foot in the air for last, current and next mode
+          const scalar_t midHeight = touchDownHeightSequence[j][p] + config_.swingHeight;  // 变量说明：midHeight 表示mid、height。
+          const CubicSpline::Node liftOffHeight{swingStartTime, midHeight, 0.0};  // 变量说明：liftOffHeight 表示lift、off、height。
+          const CubicSpline::Node touchDownHeight{swingFinalTime, midHeight, 0.0};  // 变量说明：touchDownHeight 表示touch、down、height。
+          feetHeightTrajectories_[j].emplace_back(liftOffHeight, midHeight, touchDownHeight);
+
+          const CubicSpline::Node impactProximityLiftOff{swingStartTime, config_.impactProximityFactorMidPointValue, 0.0};  // 变量说明：impactProximityLiftOff 表示impact、proximity、lift、off。
+          const CubicSpline::Node impactProximityTouchDown{swingFinalTime, config_.impactProximityFactorMidPointValue, 0.0};  // 变量说明：impactProximityTouchDown 表示impact、proximity、touch、down。
+
+          impactProximityTrajectories_[j].emplace_back(impactProximityLiftOff, config_.impactProximityFactorMidPointValue,
+                                                       impactProximityTouchDown);
+        }
+      } else {  // for a stance leg
+        // Note: setting the time here arbitrarily to 0.0 -> 1.0 makes the assert in CubicSpline fail
+        const CubicSpline::Node liftOff{0.0, liftOffHeightSequence[j][p], 0.0};  // 变量说明：liftOff 表示lift、off。
+        const CubicSpline::Node touchDown{1.0, liftOffHeightSequence[j][p], 0.0};  // 变量说明：touchDown 表示touch、down。
+        feetHeightTrajectories_[j].emplace_back(liftOff, liftOffHeightSequence[j][p], touchDown);
+
+        // If the foot is in contact the impact proximity factor is always 1.
+        const CubicSpline::Node impactProximityTouchDown{0.0, 1.0, 0};  // 变量说明：impactProximityTouchDown 表示impact、proximity、touch、down。
+        const CubicSpline::Node impactProximityLiftOff{1.0, 1.0, 0};  // 变量说明：impactProximityLiftOff 表示impact、proximity、lift、off。
+
+        impactProximityTrajectories_[j].emplace_back(impactProximityTouchDown, 1.0, impactProximityLiftOff);
+      }
+    }
+    feetHeightTrajectoriesEvents_[j] = eventTimes;
+  }
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+std::pair<std::vector<int>, std::vector<int>> SwingTrajectoryPlanner::updateFootSchedule(const std::vector<bool>& contactFlagStock) {
+  const size_t numPhases = contactFlagStock.size();  // 变量说明：numPhases 表示num、phases。
+
+  std::vector<int> startTimeIndexStock(numPhases, 0);
+  std::vector<int> finalTimeIndexStock(numPhases, 0);
+
+  // find the startTime and finalTime indices for swing feet
+  for (size_t i = 0; i < numPhases; i++) {
+    if (!contactFlagStock[i]) {
+      std::tie(startTimeIndexStock[i], finalTimeIndexStock[i]) = findIndex(i, contactFlagStock);
+    }
+  }
+  return {startTimeIndexStock, finalTimeIndexStock};
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+feet_array_t<std::vector<bool>> SwingTrajectoryPlanner::extractContactFlags(const std::vector<size_t>& phaseIDsStock) const {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  const size_t numPhases = phaseIDsStock.size();  // 变量说明：numPhases 表示num、phases。
+
+  feet_array_t<std::vector<bool>> contactFlagStock;  // 变量说明：contactFlagStock 表示接触、flag、stock。
+  std::fill(contactFlagStock.begin(), contactFlagStock.end(), std::vector<bool>(numPhases));
+
+  for (size_t i = 0; i < numPhases; i++) {
+    const auto contactFlag = modeNumber2StanceLeg(phaseIDsStock[i]);  // 变量说明：contactFlag 表示接触、flag。
+    for (size_t j = 0; j < numFeet_; j++) {
+      contactFlagStock[j][i] = contactFlag[j];
+    }
+  }
+  return contactFlagStock;
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+std::pair<int, int> SwingTrajectoryPlanner::findIndex(size_t index, const std::vector<bool>& contactFlagStock) {
+  const size_t numPhases = contactFlagStock.size();  // 变量说明：numPhases 表示num、phases。
+
+  // skip if it is a stance leg
+  if (contactFlagStock[index]) {
+    return {0, 0};
+  }
+
+  // find the starting time
+  int startTimesIndex = -1;  // 变量说明：startTimesIndex 表示start、times、索引。
+  for (int ip = index - 1; ip >= 0; ip--) {
+    if (contactFlagStock[ip]) {
+      startTimesIndex = ip;
+      break;
+    }
+  }
+
+  // find the final time
+  int finalTimesIndex = numPhases - 1;  // 变量说明：finalTimesIndex 表示最终、times、索引。
+  for (size_t ip = index + 1; ip < numPhases; ip++) {
+    if (contactFlagStock[ip]) {
+      finalTimesIndex = ip - 1;
+      break;
+    }
+  }
+
+  return {startTimesIndex, finalTimesIndex};
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+void SwingTrajectoryPlanner::checkThatIndicesAreValid(
+    int leg, int index, int startIndex, int finalIndex, const std::vector<size_t>& phaseIDsStock) {  // 变量说明：leg 表示当前处理的腿编号。
+  const size_t numSubsystems = phaseIDsStock.size();  // 变量说明：numSubsystems 表示num、subsystems。
+  if (startIndex < 0) {
+    std::cerr << "Subsystem: " << index << " out of " << numSubsystems - 1 << std::endl;
+    for (size_t i = 0; i < numSubsystems; i++) {
+      std::cerr << "[" << i << "]: " << phaseIDsStock[i] << ",  ";
+    }
+    std::cerr << std::endl;
+
+    throw std::runtime_error("The time of take-off for the first swing of the EE with ID " + std::to_string(leg) + " is not defined.");
+  }
+  if (finalIndex >= numSubsystems - 1) {
+    std::cerr << "Subsystem: " << index << " out of " << numSubsystems - 1 << std::endl;
+    for (size_t i = 0; i < numSubsystems; i++) {
+      std::cerr << "[" << i << "]: " << phaseIDsStock[i] << ",  ";
+    }
+    std::cerr << std::endl;
+
+    throw std::runtime_error("The time of touch-down for the last swing of the EE with ID " + std::to_string(leg) + " is not defined.");
+  }
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+scalar_t SwingTrajectoryPlanner::swingTrajectoryScaling(scalar_t startTime, scalar_t finalTime, scalar_t swingTimeScale) {  // 变量说明：SwingTrajectoryPlanner 表示摆动脚、轨迹、planner。
+  return std::min(1.0, (finalTime - startTime) / swingTimeScale);
+}
+
+/******************************************************************************************************/
+/******************************************************************************************************/
+/******************************************************************************************************/
+
+SwingTrajectoryPlanner::Config loadSwingTrajectorySettings(const std::string& fileName, const std::string& fieldName, bool verbose) {
+  boost::property_tree::ptree pt;  // 变量说明：pt 表示 Boost property_tree 配置树。
+  // 函数说明：读取模型信息，连接当前模块的数据流和控制逻辑。
+  boost::property_tree::read_info(fileName, pt);
+
+  if (verbose) {
+    std::cerr << "\n #### Swing Trajectory Config:";
+    std::cerr << "\n #### =============================================================================\n";
+  }
+
+  SwingTrajectoryPlanner::Config config;  // 变量说明：config 表示从配置文件读取出的参数集合。
+  const std::string prefix = fieldName + ".";  // 变量说明：prefix 表示读取 task.info 时使用的字段前缀。
+
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.liftOffVelocity, prefix + "liftOffVelocity", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.touchDownVelocity, prefix + "touchDownVelocity", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.swingHeight, prefix + "swingHeight", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.swingTimeScale, prefix + "swingTimeScale", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.touchDownHeightOffset, prefix + "touchDownHeightOffset", verbose);
+
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.impactProximityFactorLiftOffVelocity, prefix + "impactProximityFactorLiftOffVelocity", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.impactProximityFactorTouchDownVelocity, prefix + "impactProximityFactorTouchDownVelocity", verbose);
+  // 函数说明：加载ptree、数值，连接当前模块的数据流和控制逻辑。
+  loadData::loadPtreeValue(pt, config.impactProximityFactorMidPointValue, prefix + "impactProximityFactorMidPointValue", verbose);
+
+  if (verbose) {
+    std::cerr << " #### =============================================================================" << std::endl;
+  }
+
+  return config;
+}
+
+}  // namespace ocs2::humanoid
