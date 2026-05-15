@@ -1,6 +1,6 @@
 # humanoid_cd_nmpc_aligator
 
-这个目录实现“路线 A”的第一层：保持 OCS2 G1 centroidal MPC 的模型配置和 CppADCodeGen 动力学导数，只把外层求解器换成 Aligator `SolverProxDDP`。
+这个目录实现“路线 A”：保持 OCS2 G1 centroidal MPC 的模型配置、CppADCodeGen 动力学/代价/约束导数，把外层求解器换成 Aligator `SolverProxDDP`。
 
 当前可执行文件：
 
@@ -27,9 +27,27 @@ cmake -S . -B build \
 /home/songchao/OPTControl_env/wb_humanoid_mpc_ws/models/g1_description/urdf/g1_29dof.urdf
 ```
 
-## 当前对齐了什么
+## 问题模式
 
-第一层只保留最小问题：
+可执行文件现在支持两种问题：
+
+```bash
+./build/proxddp_centroidal_layer1 --problem layer1
+./build/proxddp_centroidal_layer1 --problem standard
+```
+
+默认是 `standard`。
+
+| 模式 | 内容 |
+| --- | --- |
+| `layer1` | 最小 centroidal dynamics + Q/R + terminal，用来测纯前端和求解器开销 |
+| `standard` | 按 OCS2 `humanoid_centroidal_mpc` 标准装配：task-space、foot、ICP、external torque、zeroWrench、zeroVelocity、normalVelocity、mimic equality、friction cone、contact moment、joint limits、collision soft penalty |
+
+`standard` 模式没有包含 ROS message 相关接口；它在本文件里复刻 `CentroidalMpcInterface::setupOptimalControlProblem()` 的 OCP 装配，避免引入 `humanoid_mpc_msgs`。
+
+## Layer1 对齐了什么
+
+`layer1` 只保留最小问题：
 
 ```text
 x = [h / m, base pose, joint positions]
@@ -56,9 +74,10 @@ Aligator 的 running Q/R 已按 `dt` 缩放，和 OCS2 连续时间 running cost
 ./build/proxddp_centroidal_layer1 --frontend legacy
 ./build/proxddp_centroidal_layer1 --frontend direct
 ./build/proxddp_centroidal_layer1 --frontend thin
+./build/proxddp_centroidal_layer1 --rollout nonlinear
 ```
 
-默认是 `thin`。
+默认是 `thin + nonlinear rollout`。如果只想复现实验里的线性 forward-pass timing，可以显式传 `--rollout linear`。
 
 | 模式 | 保留 | 绕开 |
 | --- | --- | --- |
@@ -74,7 +93,8 @@ DirectCentroidalEulerDynamics:
   Jx    = I + dt * dfdx
   Ju    = dt * dfdu
 
-DirectQuadraticStateInputCost:
+DirectStageCostPackAligatorCost:
+  terms = [DirectQuadraticTrackingTerm]
   lx  = Q * (x - x_ref)
   lu  = R * (u - u_ref)
   lxx = Q
@@ -125,20 +145,49 @@ ProxDDP: 每次沿时间做 Riccati backward pass，利用 shooting 的动态规
 
 因此 `derivatives` 更像两边共同要付的线性化成本；`ddp` 是 ProxDDP 的 Riccati/LQ 成本。后续如果加一个 OCS2 SQP 同问题 runner，对应要看的是 OCS2 的 linearization/precomputation 和 QP solve 时间。
 
-## 当前还没搬的部分
+## Standard 模式接入内容
 
-这版暂时没有搬 OCS2 的 task-space cost、ICP cost、external torque cost、friction cone、contact moment、zero velocity、joint limit、collision 等约束/软约束。这样可以先测“同一个 centroidal dynamics + Q/R cost”下 ProxDDP 的纯求解器开销。
+`standard` 模式把 OCS2 标准 collection 直接 clone 到 Aligator adapter：
 
-后续可以按层补：
+```text
+OCS2 StateInputCostCollection  -> DirectStageCostPackAligatorCost
+OCS2 StateCostCollection       -> DirectStageCostPackAligatorCost
+OCS2 StateInputConstraintCollection -> DirectConstraintPackAligatorFunction + EqualityConstraint
+```
 
-1. Layer 2：把 OCS2 的 Gauss-Newton AD residual cost 包到 Aligator cost/residual 里。
-2. Layer 3：把 stance/swing equality、friction/contact moment soft constraint 逐个转成 Aligator residual/cost/constraint。
-3. Layer 4：同一份 problem 同时跑 OCS2 SQP 和 Aligator ProxDDP，输出每项导数、QP/LQ、line search 的 timing。
+因此这些项已经接入：
+
+```text
+Layer2B:
+  task_space_costs.*_TaskSpaceKinematicsCost
+  left/right foot TaskSpaceKinematicsCost
+  icp_Cost
+  left/right ExternalTorqueQuadraticCost
+
+Layer3:
+  zeroWrench
+  zeroVelocity
+  normalVelocity
+  knee mimic equality（task.info 存在 mimicJoints 时）
+
+Layer4:
+  frictionForceCone soft constraint
+  contactMomentXY soft constraint
+  jointLimits state soft constraint
+  FootCollisionSoftConstraint
+```
+
+soft constraint 没有重新手写 relaxed barrier，而是直接使用 OCS2 factory 返回的 `StateInputSoftConstraint` / `StateSoftConstraint`，所以 penalty、Jacobian、Gauss-Newton/二阶近似语义和 OCS2 标准问题一致。
+
+第一次跑 `--problem standard` 可能会在当前工作目录生成并编译 `cppad_code_gen/`，这是 OCS2 CppAD 缓存，不属于仓库内容，已加入 `.gitignore`。
+
+当前 `standard` SQP runner 使用同一份 OCP 和同一条 primal guess；initializer 仍是简单 `OperatingPoints`，没有接 `CentroidalWeightCompInitializer`。由于 benchmark 显式传入整条初始轨迹，这通常不影响同问题对比。
 
 ## 常用参数
 
 ```bash
 ./build/proxddp_centroidal_layer1 \
+  --problem standard \
   --horizon 60 \
   --dt 0.02 \
   --max-iters 5 \
@@ -146,6 +195,7 @@ ProxDDP: 每次沿时间做 Riccati backward pass，利用 shooting 的动态规
   --max-al-iters 5 \
   --threads 1 \
   --frontend thin \
+  --rollout nonlinear \
   --recompile false \
   --solver-verbose false
 ```
@@ -167,7 +217,7 @@ sqp_qp              OCS2 调 HPIPM 解 QP 的时间
 sqp_linesearch      OCS2 SQP line search 时间
 ```
 
-默认 `N=20, dt=0.02`，cached codegen 后的一次参考输出：
+`layer1` 在 `--rollout linear`、默认 `N=20, dt=0.02`、cached codegen 后的一次参考输出：
 
 ```text
 legacy:
@@ -176,13 +226,13 @@ legacy:
   proxddp_ddp ~= 2.2 ms
 
 direct:
-  proxddp_solve ~= 3.5 ms
-  proxddp_derivatives ~= 1.1 ms
+  proxddp_solve ~= 4.0 ms
+  proxddp_derivatives ~= 1.3 ms
   proxddp_ddp ~= 2.2 ms
 
 thin:
-  proxddp_solve ~= 3.5 ms
-  proxddp_derivatives ~= 1.1 ms
+  proxddp_solve ~= 4.0 ms
+  proxddp_derivatives ~= 1.3 ms
   proxddp_ddp ~= 2.1 ms
 
 raw_codegen_linearization ~= 0.24 ms
@@ -197,4 +247,16 @@ sqp_qp ~= 1.2 ms
 
 ```text
 strict_diff cost_abs=... first_u_inf=... next_x_inf=... math_ocp=same aligator_frontend=thin ocs2_frontend=sqp_direct
+```
+
+`standard` 的一个缓存后 sanity check（`N=10, max-iters=1, sqp-iters=1`）：
+
+```text
+proxddp_solve ~= 4.8 ms
+proxddp_derivatives ~= 1.3 ms
+proxddp_ddp ~= 0.7 ms
+sqp_total ~= 2.6 ms
+sqp_lq ~= 1.9 ms
+sqp_qp ~= 0.5 ms
+strict_diff cost_abs ~= 1e-4
 ```

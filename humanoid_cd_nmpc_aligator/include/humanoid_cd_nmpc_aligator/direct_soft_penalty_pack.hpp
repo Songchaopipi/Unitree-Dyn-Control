@@ -31,7 +31,14 @@ class Ocs2StateInputSoftPenaltyTerm final : public DirectStageCostTerm {
     }
   }
 
+  Ocs2StateInputSoftPenaltyTerm(const Ocs2StateInputSoftPenaltyTerm& rhs)
+      : name_(rhs.name_), constraint_(rhs.constraint_ ? rhs.constraint_->clone() : nullptr), settings_(rhs.settings_) {}
+
   std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateInputSoftPenaltyTerm>(*this);
+  }
 
   void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
            PackedCostWorkspace& out) const override {
@@ -99,7 +106,14 @@ class Ocs2StateSoftPenaltyTerm final : public DirectStageCostTerm {
     }
   }
 
+  Ocs2StateSoftPenaltyTerm(const Ocs2StateSoftPenaltyTerm& rhs)
+      : name_(rhs.name_), constraint_(rhs.constraint_ ? rhs.constraint_->clone() : nullptr), settings_(rhs.settings_) {}
+
   std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateSoftPenaltyTerm>(*this);
+  }
 
   void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
            PackedCostWorkspace& out) const override {

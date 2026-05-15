@@ -11,7 +11,9 @@
 
 #include <ocs2_core/PreComputation.h>
 #include <ocs2_core/Types.h>
+#include <ocs2_core/cost/StateCostCollection.h>
 #include <ocs2_core/cost/StateCost.h>
+#include <ocs2_core/cost/StateInputCostCollection.h>
 #include <ocs2_core/cost/StateInputCost.h>
 #include <ocs2_core/reference/TargetTrajectories.h>
 
@@ -23,13 +25,15 @@ struct DirectStageCostContext {
   double time{0.0};
   double dt{1.0};
   const ocs2::TargetTrajectories* targetTrajectories{nullptr};
-  const ocs2::PreComputation* preComputation{nullptr};
+  ocs2::PreComputation* preComputation{nullptr};
+  bool isFinal{false};
 };
 
 class DirectStageCostTerm {
  public:
   virtual ~DirectStageCostTerm() = default;
   virtual std::string name() const = 0;
+  virtual std::unique_ptr<DirectStageCostTerm> clone() const = 0;
   virtual void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
                    PackedCostWorkspace& out) const = 0;
 };
@@ -40,6 +44,10 @@ class DirectQuadraticTrackingTerm final : public DirectStageCostTerm {
       : xRef_(std::move(xRef)), uRef_(std::move(uRef)), Q_(std::move(Q)), R_(std::move(R)) {}
 
   std::string name() const override { return "direct_quadratic_tracking"; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<DirectQuadraticTrackingTerm>(*this);
+  }
 
   void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
            PackedCostWorkspace& out) const override {
@@ -61,6 +69,10 @@ class DirectTerminalQuadraticTrackingTerm final : public DirectStageCostTerm {
 
   std::string name() const override { return "direct_terminal_quadratic_tracking"; }
 
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<DirectTerminalQuadraticTrackingTerm>(*this);
+  }
+
   void add(const DirectStageCostContext&, const Eigen::VectorXd& x, const Eigen::VectorXd&,
            PackedCostWorkspace& out) const override {
     addQuadraticStateTracking(out, x, xRef_, Qf_);
@@ -80,7 +92,14 @@ class Ocs2StateInputCostTerm final : public DirectStageCostTerm {
     }
   }
 
+  Ocs2StateInputCostTerm(const Ocs2StateInputCostTerm& rhs)
+      : name_(rhs.name_), cost_(rhs.cost_ ? rhs.cost_->clone() : nullptr) {}
+
   std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateInputCostTerm>(*this);
+  }
 
   void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
            PackedCostWorkspace& out) const override {
@@ -112,6 +131,51 @@ class Ocs2StateInputCostTerm final : public DirectStageCostTerm {
   std::unique_ptr<ocs2::StateInputCost> cost_;
 };
 
+class Ocs2StateInputCostCollectionTerm final : public DirectStageCostTerm {
+ public:
+  Ocs2StateInputCostCollectionTerm(std::string name, std::unique_ptr<ocs2::StateInputCostCollection> costs)
+      : name_(std::move(name)), costs_(std::move(costs)) {
+    if (!costs_) {
+      throw std::invalid_argument("Ocs2StateInputCostCollectionTerm requires a valid collection");
+    }
+  }
+
+  Ocs2StateInputCostCollectionTerm(const Ocs2StateInputCostCollectionTerm& rhs)
+      : name_(rhs.name_), costs_(rhs.costs_ ? rhs.costs_->clone() : nullptr) {}
+
+  std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateInputCostCollectionTerm>(*this);
+  }
+
+  void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd& u,
+           PackedCostWorkspace& out) const override {
+    if (!context.targetTrajectories || !context.preComputation) {
+      throw std::invalid_argument("Ocs2StateInputCostCollectionTerm requires target trajectories and pre-computation");
+    }
+
+    const ocs2::ScalarFunctionQuadraticApproximation q =
+        costs_->getQuadraticApproximation(context.time, x, u, *context.targetTrajectories, *context.preComputation);
+    addOcs2QuadraticApproximation(out, context.dt, q);
+  }
+
+ private:
+  static void addOcs2QuadraticApproximation(PackedCostWorkspace& out, double scale,
+                                            const ocs2::ScalarFunctionQuadraticApproximation& q) {
+    out.value += scale * q.f;
+    out.Lx.noalias() += scale * q.dfdx;
+    out.Lu.noalias() += scale * q.dfdu;
+    out.Lxx.noalias() += scale * q.dfdxx;
+    out.Lux.noalias() += scale * q.dfdux;
+    out.Lxu.noalias() += scale * q.dfdux.transpose();
+    out.Luu.noalias() += scale * q.dfduu;
+  }
+
+  std::string name_;
+  std::unique_ptr<ocs2::StateInputCostCollection> costs_;
+};
+
 class Ocs2StateCostTerm final : public DirectStageCostTerm {
  public:
   Ocs2StateCostTerm(std::string name, std::unique_ptr<ocs2::StateCost> cost, bool scaleByDt)
@@ -121,7 +185,14 @@ class Ocs2StateCostTerm final : public DirectStageCostTerm {
     }
   }
 
+  Ocs2StateCostTerm(const Ocs2StateCostTerm& rhs)
+      : name_(rhs.name_), cost_(rhs.cost_ ? rhs.cost_->clone() : nullptr), scaleByDt_(rhs.scaleByDt_) {}
+
   std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateCostTerm>(*this);
+  }
 
   void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd&,
            PackedCostWorkspace& out) const override {
@@ -146,8 +217,67 @@ class Ocs2StateCostTerm final : public DirectStageCostTerm {
   bool scaleByDt_{true};
 };
 
+class Ocs2StateCostCollectionTerm final : public DirectStageCostTerm {
+ public:
+  Ocs2StateCostCollectionTerm(std::string name, std::unique_ptr<ocs2::StateCostCollection> costs, bool scaleByDt)
+      : name_(std::move(name)), costs_(std::move(costs)), scaleByDt_(scaleByDt) {
+    if (!costs_) {
+      throw std::invalid_argument("Ocs2StateCostCollectionTerm requires a valid collection");
+    }
+  }
+
+  Ocs2StateCostCollectionTerm(const Ocs2StateCostCollectionTerm& rhs)
+      : name_(rhs.name_), costs_(rhs.costs_ ? rhs.costs_->clone() : nullptr), scaleByDt_(rhs.scaleByDt_) {}
+
+  std::string name() const override { return name_; }
+
+  std::unique_ptr<DirectStageCostTerm> clone() const override {
+    return std::make_unique<Ocs2StateCostCollectionTerm>(*this);
+  }
+
+  void add(const DirectStageCostContext& context, const Eigen::VectorXd& x, const Eigen::VectorXd&,
+           PackedCostWorkspace& out) const override {
+    if (!context.targetTrajectories || !context.preComputation) {
+      throw std::invalid_argument("Ocs2StateCostCollectionTerm requires target trajectories and pre-computation");
+    }
+
+    const double scale = scaleByDt_ ? context.dt : 1.0;
+    const ocs2::ScalarFunctionQuadraticApproximation q =
+        costs_->getQuadraticApproximation(context.time, x, *context.targetTrajectories, *context.preComputation);
+    out.value += scale * q.f;
+    out.Lx.noalias() += scale * q.dfdx;
+    out.Lxx.noalias() += scale * q.dfdxx;
+  }
+
+ private:
+  std::string name_;
+  std::unique_ptr<ocs2::StateCostCollection> costs_;
+  bool scaleByDt_{true};
+};
+
 class DirectStageCostPack {
  public:
+  DirectStageCostPack() = default;
+
+  DirectStageCostPack(const DirectStageCostPack& rhs) {
+    terms_.reserve(rhs.terms_.size());
+    for (const auto& term : rhs.terms_) {
+      terms_.push_back(term->clone());
+    }
+  }
+
+  DirectStageCostPack& operator=(const DirectStageCostPack& rhs) {
+    if (this == &rhs) {
+      return *this;
+    }
+    DirectStageCostPack tmp(rhs);
+    terms_ = std::move(tmp.terms_);
+    return *this;
+  }
+
+  DirectStageCostPack(DirectStageCostPack&&) noexcept = default;
+  DirectStageCostPack& operator=(DirectStageCostPack&&) noexcept = default;
+
   void addTerm(std::unique_ptr<DirectStageCostTerm> term) {
     if (!term) {
       throw std::invalid_argument("DirectStageCostPack::addTerm received null term");
@@ -188,9 +318,7 @@ class DirectStageCostPackAligatorCost final : public aligator::CostAbstractTpl<d
     evaluatePack(x, u, data);
   }
 
-  void computeHessians(const ConstVectorRef& x, const ConstVectorRef& u, CostData& data) const override {
-    evaluatePack(x, u, data);
-  }
+  void computeHessians(const ConstVectorRef&, const ConstVectorRef&, CostData&) const override {}
 
   std::shared_ptr<CostData> createData() const override {
     return std::make_shared<CostData>(this->ndx(), this->nu);
@@ -200,6 +328,14 @@ class DirectStageCostPackAligatorCost final : public aligator::CostAbstractTpl<d
   void evaluatePack(const ConstVectorRef& x, const ConstVectorRef& u, CostData& data) const {
     const Eigen::VectorXd xVec = x;
     const Eigen::VectorXd uVec = u;
+    if (context_.preComputation) {
+      constexpr auto request = ocs2::Request::Cost + ocs2::Request::SoftConstraint + ocs2::Request::Approximation;
+      if (context_.isFinal) {
+        context_.preComputation->requestFinal(request, context_.time, xVec);
+      } else {
+        context_.preComputation->request(request, context_.time, xVec, uVec);
+      }
+    }
     pack_.evaluate(context_, xVec, uVec, workspace_);
 
     data.value_ = workspace_.value;

@@ -178,8 +178,8 @@ doc/doxygen/xml/cmake-build-release_2CMakeFiles_2wbc__speed__test_8dir_2link_8tx
 .idea/
 
 build/
+cppad_code_gen/
 
 record/datalog.log
 
 .vscode/
-

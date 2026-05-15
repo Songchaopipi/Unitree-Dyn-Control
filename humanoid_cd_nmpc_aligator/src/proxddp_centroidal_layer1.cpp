@@ -21,6 +21,7 @@
 #include <aligator/core/stage-data.hpp>
 #include <aligator/modelling/costs/quad-state-cost.hpp>
 #include <aligator/modelling/costs/sum-of-costs.hpp>
+#include <aligator/modelling/constraints/equality-constraint.hpp>
 #include <aligator/modelling/dynamics/integrator-euler.hpp>
 #include <aligator/modelling/dynamics/ode-abstract.hpp>
 #include <aligator/core/vector-space.hpp>
@@ -29,7 +30,9 @@
 #include <humanoid_common_mpc/common/ModelSettings.h>
 #include <humanoid_common_mpc/pinocchio_model/createPinocchioModel.h>
 #include <ocs2_centroidal_model/AccessHelperFunctions.h>
+#include <ocs2_centroidal_model/CentroidalModelPinocchioMapping.h>
 #include <ocs2_centroidal_model/FactoryFunctions.h>
+#include <ocs2_centroidal_model/ModelHelperFunctions.h>
 #include <ocs2_centroidal_model/PinocchioCentroidalDynamicsAD.h>
 #include <ocs2_core/PreComputation.h>
 #include <ocs2_core/cost/QuadraticStateCost.h>
@@ -38,11 +41,33 @@
 #include <ocs2_core/initialization/OperatingPoints.h>
 #include <ocs2_core/integration/SensitivityIntegrator.h>
 #include <ocs2_core/misc/LoadData.h>
+#include <ocs2_core/misc/Numerics.h>
 #include <ocs2_oc/oc_data/PrimalSolution.h>
 #include <ocs2_oc/oc_problem/OptimalControlProblem.h>
 #include <ocs2_oc/synchronized_module/ReferenceManager.h>
+#include <ocs2_pinocchio_interface/PinocchioEndEffectorKinematicsCppAd.h>
 #include <ocs2_sqp/SqpSettings.h>
 #include <ocs2_sqp/SqpSolver.h>
+
+#include <humanoid_centroidal_mpc/common/CentroidalMpcRobotModel.h>
+#include <humanoid_centroidal_mpc/constraint/JointMimicKinematicConstraint.h>
+#include <humanoid_centroidal_mpc/constraint/NormalVelocityConstraintCppAd.h>
+#include <humanoid_centroidal_mpc/constraint/ZeroVelocityConstraintCppAd.h>
+#include <humanoid_centroidal_mpc/cost/CentroidalMpcEndEffectorFootCost.h>
+#include <humanoid_centroidal_mpc/cost/ICPCost.h>
+#include <humanoid_centroidal_mpc/dynamics/CentroidalDynamicsAD.h>
+#include <humanoid_common_mpc/HumanoidCostConstraintFactory.h>
+#include <humanoid_common_mpc/HumanoidPreComputation.h>
+#include <humanoid_common_mpc/constraint/EndEffectorKinematicsTwistConstraint.h>
+#include <humanoid_common_mpc/cost/EndEffectorKinematicsQuadraticCost.h>
+#include <humanoid_common_mpc/gait/GaitSchedule.h>
+#include <humanoid_common_mpc/reference_manager/SwitchedModelReferenceManager.h>
+#include <humanoid_common_mpc/swing_foot_planner/SwingTrajectoryPlanner.h>
+#include <humanoid_cd_nmpc_aligator/direct_constraint_pack.hpp>
+#include <humanoid_cd_nmpc_aligator/direct_stage_cost_pack.hpp>
+
+#include <boost/property_tree/info_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 namespace {
 
@@ -55,13 +80,27 @@ using SolverProxDDP = aligator::SolverProxDDPTpl<double>;
 using StageModel = aligator::StageModelTpl<double>;
 using TrajOptProblem = aligator::TrajOptProblemTpl<double>;
 using VectorSpace = aligator::VectorSpaceTpl<double>;
+using DirectStageCostContext = humanoid_cd_nmpc_aligator::DirectStageCostContext;
+using DirectStageCostPackAligatorCost = humanoid_cd_nmpc_aligator::DirectStageCostPackAligatorCost;
+using DirectConstraintContext = humanoid_cd_nmpc_aligator::DirectConstraintContext;
+using DirectConstraintPackAligatorFunction = humanoid_cd_nmpc_aligator::DirectConstraintPackAligatorFunction;
 
 constexpr double kGravity = 9.80665;
+
+enum class ProblemMode {
+  Layer1,
+  Standard,
+};
 
 enum class FrontendMode {
   Legacy,
   Direct,
   Thin,
+};
+
+enum class RolloutMode {
+  Linear,
+  Nonlinear,
 };
 
 std::string defaultWsPath() {
@@ -110,6 +149,28 @@ FrontendMode parseFrontendMode(const std::string& text) {
   throw std::invalid_argument("Unknown frontend mode: " + text + " (expected legacy, direct, or thin)");
 }
 
+RolloutMode parseRolloutMode(const std::string& text) {
+  const std::string value = toLower(text);
+  if (value == "linear") {
+    return RolloutMode::Linear;
+  }
+  if (value == "nonlinear") {
+    return RolloutMode::Nonlinear;
+  }
+  throw std::invalid_argument("Unknown rollout mode: " + text + " (expected linear or nonlinear)");
+}
+
+ProblemMode parseProblemMode(const std::string& text) {
+  const std::string value = toLower(text);
+  if (value == "layer1") {
+    return ProblemMode::Layer1;
+  }
+  if (value == "standard" || value == "ocs2") {
+    return ProblemMode::Standard;
+  }
+  throw std::invalid_argument("Unknown problem mode: " + text + " (expected layer1 or standard)");
+}
+
 const char* frontendModeName(FrontendMode mode) {
   switch (mode) {
     case FrontendMode::Legacy:
@@ -118,6 +179,26 @@ const char* frontendModeName(FrontendMode mode) {
       return "direct";
     case FrontendMode::Thin:
       return "thin";
+  }
+  return "unknown";
+}
+
+const char* problemModeName(ProblemMode mode) {
+  switch (mode) {
+    case ProblemMode::Layer1:
+      return "layer1";
+    case ProblemMode::Standard:
+      return "standard";
+  }
+  return "unknown";
+}
+
+const char* rolloutModeName(RolloutMode mode) {
+  switch (mode) {
+    case RolloutMode::Linear:
+      return "linear";
+    case RolloutMode::Nonlinear:
+      return "nonlinear";
   }
   return "unknown";
 }
@@ -149,7 +230,9 @@ struct Options {
   int threads = 1;
   double tolerance = 1e-4;
   double muInit = 1e-2;
+  ProblemMode problemMode = ProblemMode::Standard;
   FrontendMode frontend = FrontendMode::Thin;
+  RolloutMode rollout = RolloutMode::Nonlinear;
   bool recompileCodegen = false;
   bool verbose = false;
   bool solverVerbose = false;
@@ -185,7 +268,9 @@ void printUsage(const char* argv0) {
       << "  --threads N               Aligator derivative threads, default 1\n"
       << "  --tol VALUE               ProxDDP tolerance, default 1e-4\n"
       << "  --mu-init VALUE           ProxDDP initial AL/prox penalty, default 1e-2\n"
+      << "  --problem MODE            layer1 or standard, default standard\n"
       << "  --frontend MODE           legacy, direct, or thin, default thin\n"
+      << "  --rollout MODE            linear or nonlinear, default nonlinear\n"
       << "  --recompile true|false    rebuild OCS2 codegen library, default false\n"
       << "  --verbose true|false      verbose OCS2 model/codegen loading, default false\n"
       << "  --solver-verbose true|false\n"
@@ -230,8 +315,12 @@ Options parseOptions(int argc, char** argv) {
       options.tolerance = parseNumber<double>(value);
     } else if (key == "--mu-init") {
       options.muInit = parseNumber<double>(value);
+    } else if (key == "--problem") {
+      options.problemMode = parseProblemMode(value);
     } else if (key == "--frontend") {
       options.frontend = parseFrontendMode(value);
+    } else if (key == "--rollout") {
+      options.rollout = parseRolloutMode(value);
     } else if (key == "--recompile") {
       options.recompileCodegen = parseBool(value);
     } else if (key == "--verbose") {
@@ -309,6 +398,13 @@ struct Layer1References {
   Eigen::VectorXd uRef;
 };
 
+struct StandardOcs2Bundle {
+  std::unique_ptr<ocs2::humanoid::CentroidalMpcRobotModel<ocs2::scalar_t>> mpcRobotModel;
+  std::unique_ptr<ocs2::humanoid::CentroidalMpcRobotModel<ocs2::ad_scalar_t>> mpcRobotModelAD;
+  std::shared_ptr<ocs2::humanoid::SwitchedModelReferenceManager> referenceManager;
+  ocs2::OptimalControlProblem problem;
+};
+
 Layer1References makeLayer1References(const Options& options, const ocs2::CentroidalModelInfo& info, const Eigen::VectorXd& x0) {
   Layer1References refs;
   refs.q = loadMatrixOrIdentity(options.taskFile, "Q", static_cast<int>(info.stateDim), static_cast<int>(info.stateDim), 1.0);
@@ -318,6 +414,192 @@ Layer1References makeLayer1References(const Options& options, const ocs2::Centro
   refs.xRef = x0;
   refs.uRef = makeNominalInput(info);
   return refs;
+}
+
+std::unique_ptr<ocs2::StateInputConstraint> makeStanceFootConstraint(
+    const ocs2::humanoid::SwitchedModelReferenceManager& referenceManager,
+    const ocs2::humanoid::ModelSettings& modelSettings,
+    const ocs2::EndEffectorKinematics<ocs2::scalar_t>& eeKinematics,
+    std::size_t contactPointIndex) {
+  auto eeZeroVelConConfig = [](ocs2::scalar_t positionErrorGain, ocs2::scalar_t orientationErrorGain) {
+    ocs2::humanoid::EndEffectorKinematicsTwistConstraint::Config config;
+    config.b.setZero(6);
+    config.Ax.setZero(6, 6);
+    config.Av.setIdentity(6, 6);
+    if (!ocs2::numerics::almost_eq(positionErrorGain, 0.0)) {
+      config.Ax(2, 2) = positionErrorGain;
+    }
+    if (!ocs2::numerics::almost_eq(orientationErrorGain, 0.0)) {
+      config.Ax.block(3, 3, 3, 3) = Eigen::MatrixXd::Identity(3, 3) * orientationErrorGain;
+    }
+    return config;
+  };
+
+  return std::make_unique<ocs2::humanoid::ZeroVelocityConstraintCppAd>(
+      referenceManager, eeKinematics, contactPointIndex,
+      eeZeroVelConConfig(modelSettings.footConstraintConfig.positionErrorGain_z,
+                         modelSettings.footConstraintConfig.orientationErrorGain));
+}
+
+std::unique_ptr<ocs2::StateInputConstraint> makeNormalVelocityConstraint(
+    const ocs2::humanoid::SwitchedModelReferenceManager& referenceManager,
+    const ocs2::EndEffectorKinematics<ocs2::scalar_t>& eeKinematics,
+    std::size_t contactPointIndex) {
+  return std::make_unique<ocs2::humanoid::NormalVelocityConstraintCppAd>(referenceManager, eeKinematics, contactPointIndex);
+}
+
+std::unique_ptr<ocs2::StateInputConstraint> makeJointMimicConstraint(
+    const std::string& taskFile,
+    const ocs2::humanoid::MpcRobotModelBase<ocs2::scalar_t>& mpcRobotModel,
+    std::size_t mimicIndex,
+    bool verbose) {
+  boost::property_tree::ptree pt;
+  boost::property_tree::read_info(taskFile, pt);
+  std::string prefix;
+  if (mimicIndex == 0) {
+    prefix = "mimicJoints.left_knee.";
+  } else if (mimicIndex == 1) {
+    prefix = "mimicJoints.right_knee.";
+  } else {
+    throw std::runtime_error("No mimic joint for index: " + std::to_string(mimicIndex));
+  }
+
+  std::string parentJointName;
+  std::string childJointName;
+  ocs2::scalar_t multiplier = 1.0;
+  ocs2::scalar_t positionGain = 0.0;
+  ocs2::loadData::loadPtreeValue(pt, parentJointName, prefix + "parentJointName", verbose);
+  ocs2::loadData::loadPtreeValue(pt, childJointName, prefix + "childJointName", verbose);
+  ocs2::loadData::loadPtreeValue(pt, multiplier, prefix + "multiplier", verbose);
+  ocs2::loadData::loadPtreeValue(pt, positionGain, prefix + "positionGain", verbose);
+
+  ocs2::humanoid::JointMimicKinematicConstraint::Config config(
+      mpcRobotModel, parentJointName, childJointName, multiplier, positionGain);
+  return std::make_unique<ocs2::humanoid::JointMimicKinematicConstraint>(mpcRobotModel, config);
+}
+
+bool taskFileHasMimicJoints(const std::string& taskFile) {
+  boost::property_tree::ptree pt;
+  boost::property_tree::read_info(taskFile, pt);
+  return ocs2::loadData::containsPtreeValueFind(pt, "mimicJoints");
+}
+
+void addTaskSpaceKinematicsCostsToStandardProblem(
+    const Options& options,
+    const ocs2::PinocchioInterface& pinocchioInterface,
+    const ocs2::CentroidalModelInfo& info,
+    const ocs2::humanoid::ModelSettings& modelSettings,
+    const ocs2::humanoid::MpcRobotModelBase<ocs2::ad_scalar_t>& mpcRobotModelAD,
+    const ocs2::CentroidalModelPinocchioMappingCppAd& pinocchioMappingCppAd,
+    const ocs2::PinocchioEndEffectorKinematicsCppAd::update_pinocchio_interface_callback& velocityUpdateCallback,
+    ocs2::OptimalControlProblem& problem) {
+  boost::property_tree::ptree pt;
+  boost::property_tree::read_info(options.taskFile, pt);
+  const boost::property_tree::ptree taskSpaceCostsPt = pt.get_child("task_space_costs");
+
+  for (const auto& taskSpaceCost : taskSpaceCostsPt) {
+    const std::string costName = taskSpaceCost.first;
+    std::string linkName;
+    ocs2::loadData::loadPtreeValue(taskSpaceCostsPt, linkName, costName + ".link_name", options.verbose);
+
+    ocs2::PinocchioEndEffectorKinematicsCppAd eeKinematics(
+        pinocchioInterface, pinocchioMappingCppAd, {linkName}, info.stateDim, info.inputDim, velocityUpdateCallback,
+        linkName, modelSettings.modelFolderCppAd, modelSettings.recompileLibrariesCppAd, modelSettings.verboseCppAd);
+    const ocs2::humanoid::EndEffectorKinematicsWeights weights =
+        ocs2::humanoid::EndEffectorKinematicsWeights::getWeights(
+            options.taskFile, "task_space_costs." + costName + ".weights.", options.verbose);
+
+    problem.costPtr->add(
+        costName + "_TaskSpaceKinematicsCost",
+        std::make_unique<ocs2::humanoid::EndEffectorKinematicsQuadraticCost>(
+            weights, pinocchioInterface, eeKinematics, mpcRobotModelAD, linkName, modelSettings));
+  }
+}
+
+StandardOcs2Bundle buildStandardOcs2Bundle(const Options& options,
+                                           const ocs2::humanoid::ModelSettings& modelSettings,
+                                           const ocs2::PinocchioInterface& pinocchioInterface,
+                                           const ocs2::CentroidalModelInfo& info) {
+  StandardOcs2Bundle bundle;
+  bundle.mpcRobotModel = std::make_unique<ocs2::humanoid::CentroidalMpcRobotModel<ocs2::scalar_t>>(
+      modelSettings, pinocchioInterface, info);
+  bundle.mpcRobotModelAD = std::make_unique<ocs2::humanoid::CentroidalMpcRobotModel<ocs2::ad_scalar_t>>(
+      modelSettings, pinocchioInterface.toCppAd(), info.toCppAd());
+
+  auto swingTrajectoryPlanner = std::make_shared<ocs2::humanoid::SwingTrajectoryPlanner>(
+      ocs2::humanoid::loadSwingTrajectorySettings(options.taskFile, "swing_trajectory_config", options.verbose),
+      ocs2::N_CONTACTS);
+  bundle.referenceManager = std::make_shared<ocs2::humanoid::SwitchedModelReferenceManager>(
+      ocs2::humanoid::GaitSchedule::loadGaitSchedule(options.referenceFile, modelSettings, options.verbose),
+      swingTrajectoryPlanner, pinocchioInterface, *bundle.mpcRobotModel);
+  bundle.referenceManager->setArmSwingReferenceActive(true);
+
+  ocs2::humanoid::HumanoidCostConstraintFactory factory(
+      options.taskFile, options.referenceFile, *bundle.referenceManager, pinocchioInterface, *bundle.mpcRobotModel,
+      *bundle.mpcRobotModelAD, modelSettings, options.verbose);
+
+  bundle.problem.dynamicsPtr = std::make_unique<ocs2::humanoid::CentroidalDynamicsAD>(
+      pinocchioInterface, info, "dynamics", modelSettings);
+  bundle.problem.costPtr->add("stateInputQuadraticCost", factory.getStateInputQuadraticCost());
+  bundle.problem.finalCostPtr->add("terminalCost", factory.getTerminalCost());
+
+  const auto infoCppAd = info.toCppAd();
+  const ocs2::CentroidalModelPinocchioMappingCppAd pinocchioMappingCppAd(infoCppAd);
+  auto velocityUpdateCallback = [&infoCppAd](const ocs2::ad_vector_t& state,
+                                             ocs2::PinocchioInterfaceCppAd& pinocchioInterfaceAd) {
+    const ocs2::ad_vector_t q = ocs2::centroidal_model::getGeneralizedCoordinates(state, infoCppAd);
+    ocs2::updateCentroidalDynamics(pinocchioInterfaceAd, infoCppAd, q);
+  };
+
+  addTaskSpaceKinematicsCostsToStandardProblem(options, pinocchioInterface, info, modelSettings, *bundle.mpcRobotModelAD,
+                                               pinocchioMappingCppAd, velocityUpdateCallback, bundle.problem);
+
+  const ocs2::vector2_t icpWeights =
+      ocs2::humanoid::ICPCost::getWeights(options.taskFile, "icp_cost_weights.", options.verbose);
+  bundle.problem.costPtr->add(
+      "icp_Cost",
+      std::make_unique<ocs2::humanoid::ICPCost>(*bundle.referenceManager, icpWeights, pinocchioInterface,
+                                                *bundle.mpcRobotModelAD, "icp_Cost", modelSettings));
+
+  bundle.problem.stateSoftConstraintPtr->add("jointLimits", factory.getJointLimitsConstraint());
+  bundle.problem.stateSoftConstraintPtr->add("FootCollisionSoftConstraint", factory.getFootCollisionConstraint());
+
+  const ocs2::humanoid::EndEffectorKinematicsWeights footTrackingCostWeights =
+      ocs2::humanoid::EndEffectorKinematicsWeights::getWeights(
+          options.taskFile, "task_space_foot_cost_weights.", options.verbose);
+  const bool hasMimicJoints = taskFileHasMimicJoints(options.taskFile);
+
+  for (std::size_t i = 0; i < ocs2::N_CONTACTS; ++i) {
+    const std::string& footName = modelSettings.contactNames[i];
+    ocs2::PinocchioEndEffectorKinematicsCppAd eeKinematics(
+        pinocchioInterface, pinocchioMappingCppAd, {footName}, info.stateDim, info.inputDim, velocityUpdateCallback,
+        footName, modelSettings.modelFolderCppAd, modelSettings.recompileLibrariesCppAd, modelSettings.verboseCppAd);
+
+    bundle.problem.softConstraintPtr->add(footName + "_frictionForceCone", factory.getFrictionForceConeConstraint(i));
+    bundle.problem.softConstraintPtr->add(footName + "_contactMomentXY",
+                                          factory.getContactMomentXYConstraint(i, footName + "_contact_moment_XY_constraint"));
+    bundle.problem.equalityConstraintPtr->add(footName + "_zeroWrench", factory.getZeroWrenchConstraint(i));
+    bundle.problem.equalityConstraintPtr->add(footName + "_zeroVelocity",
+                                              makeStanceFootConstraint(*bundle.referenceManager, modelSettings, eeKinematics, i));
+    bundle.problem.equalityConstraintPtr->add(footName + "_normalVelocity",
+                                              makeNormalVelocityConstraint(*bundle.referenceManager, eeKinematics, i));
+    if (hasMimicJoints) {
+      bundle.problem.equalityConstraintPtr->add(footName + "_kneeJointMimic",
+                                                makeJointMimicConstraint(options.taskFile, *bundle.mpcRobotModel, i, options.verbose));
+    }
+
+    const std::string footTrackingCostName = footName + "_TaskSpaceKinematicsCost";
+    bundle.problem.costPtr->add(
+        footTrackingCostName,
+        std::make_unique<ocs2::humanoid::CentroidalMpcEndEffectorFootCost>(
+            *bundle.referenceManager, footTrackingCostWeights, pinocchioInterface, *bundle.mpcRobotModelAD, i,
+            footTrackingCostName, modelSettings));
+    bundle.problem.costPtr->add(footName + "_ExternalTorqueQuadraticCost", factory.getExternalTorqueQuadraticCost(i));
+  }
+
+  bundle.problem.preComputationPtr = std::make_unique<ocs2::humanoid::HumanoidPreComputation>(
+      pinocchioInterface, *bundle.referenceManager->getSwingTrajectoryPlanner(), *bundle.mpcRobotModel);
+  return bundle;
 }
 
 class Ocs2CentroidalOde final : public aligator::dynamics::ODEAbstractTpl<double> {
@@ -389,79 +671,9 @@ class DirectCentroidalEulerDynamics final : public aligator::ExplicitDynamicsMod
   double dt_{0.0};
 };
 
-class DirectQuadraticStateInputCost final : public aligator::CostAbstractTpl<double> {
- public:
-  using Base = aligator::CostAbstractTpl<double>;
-  using CostData = aligator::CostDataAbstractTpl<double>;
-
-  DirectQuadraticStateInputCost(const VectorSpace& space, int nu, Eigen::VectorXd xRef, Eigen::VectorXd uRef,
-                                Eigen::MatrixXd q, Eigen::MatrixXd r)
-      : Base(space, nu),
-        xRef_(std::move(xRef)),
-        uRef_(std::move(uRef)),
-        q_(std::move(q)),
-        r_(std::move(r)),
-        qxRef_(q_ * xRef_),
-        ruRef_(r_ * uRef_),
-        xRefQxRef_(xRef_.dot(qxRef_)),
-        uRefRuRef_(uRef_.dot(ruRef_)) {
-    const int ndx = this->ndx();
-    if (xRef_.size() != ndx || q_.rows() != ndx || q_.cols() != ndx) {
-      throw std::invalid_argument("DirectQuadraticStateInputCost has inconsistent state dimensions");
-    }
-    if (uRef_.size() != nu || r_.rows() != nu || r_.cols() != nu) {
-      throw std::invalid_argument("DirectQuadraticStateInputCost has inconsistent input dimensions");
-    }
-  }
-
-  void evaluate(const ConstVectorRef& x, const ConstVectorRef& u, CostData& data) const override {
-    data.Lx_.noalias() = q_ * x;
-    const double stateValue = 0.5 * (x.dot(data.Lx_) - 2.0 * x.dot(qxRef_) + xRefQxRef_);
-    data.Lx_.noalias() -= qxRef_;
-
-    data.Lu_.noalias() = r_ * u;
-    const double inputValue = 0.5 * (u.dot(data.Lu_) - 2.0 * u.dot(ruRef_) + uRefRuRef_);
-    data.Lu_.noalias() -= ruRef_;
-
-    data.value_ = stateValue + inputValue;
-  }
-
-  void computeGradients(const ConstVectorRef& x, const ConstVectorRef& u, CostData& data) const override {
-    data.Lx_.noalias() = q_ * x;
-    data.Lx_.noalias() -= qxRef_;
-    data.Lu_.noalias() = r_ * u;
-    data.Lu_.noalias() -= ruRef_;
-  }
-
-  void computeHessians(const ConstVectorRef&, const ConstVectorRef&, CostData&) const override {}
-
-  std::shared_ptr<CostData> createData() const override {
-    auto data = std::make_shared<CostData>(this->ndx(), this->nu);
-    fillHessian(*data);
-    return data;
-  }
-
- private:
-  void fillHessian(CostData& data) const {
-    data.Lxx_ = q_;
-    data.Lxu_.setZero();
-    data.Lux_.setZero();
-    data.Luu_ = r_;
-  }
-
-  Eigen::VectorXd xRef_;
-  Eigen::VectorXd uRef_;
-  Eigen::MatrixXd q_;
-  Eigen::MatrixXd r_;
-  Eigen::VectorXd qxRef_;
-  Eigen::VectorXd ruRef_;
-  double xRefQxRef_{0.0};
-  double uRefRuRef_{0.0};
-};
-
 class ThinCentroidalStageModel final : public StageModel {
  public:
-  ThinCentroidalStageModel(const DirectQuadraticStateInputCost& cost, const DirectCentroidalEulerDynamics& dynamics)
+  ThinCentroidalStageModel(const DirectStageCostPackAligatorCost& cost, const DirectCentroidalEulerDynamics& dynamics)
       : StageModel(cost, dynamics) {}
 
   void evaluate(const ConstVectorRef& x, const ConstVectorRef& u, Data& data) const override {
@@ -495,8 +707,8 @@ class ThinCentroidalStageModel final : public StageModel {
     return static_cast<const DirectCentroidalEulerDynamics&>(*this->dynamics_);
   }
 
-  const DirectQuadraticStateInputCost& directCost() const {
-    return static_cast<const DirectQuadraticStateInputCost&>(*this->cost_);
+  const DirectStageCostPackAligatorCost& directCost() const {
+    return static_cast<const DirectStageCostPackAligatorCost&>(*this->cost_);
   }
 };
 
@@ -530,13 +742,73 @@ class Ocs2CentroidalSystemDynamics final : public ocs2::SystemDynamicsBase {
   std::shared_ptr<ocs2::PinocchioCentroidalDynamicsAD> dynamics_;
 };
 
+class Ocs2SystemEulerDynamics final : public aligator::ExplicitDynamicsModelTpl<double> {
+ public:
+  using Base = aligator::ExplicitDynamicsModelTpl<double>;
+  using Data = aligator::ExplicitDynamicsDataTpl<double>;
+
+  Ocs2SystemEulerDynamics(const VectorSpace& space, int nu, std::unique_ptr<ocs2::SystemDynamicsBase> dynamics,
+                          ocs2::PreComputation* preComputation, double time, double dt)
+      : Base(space, nu),
+        dynamics_(std::move(dynamics)),
+        preComputation_(preComputation),
+        time_(time),
+        dt_(dt) {
+    if (!dynamics_) {
+      throw std::invalid_argument("Ocs2SystemEulerDynamics requires a valid dynamics object");
+    }
+    if (!preComputation_) {
+      throw std::invalid_argument("Ocs2SystemEulerDynamics requires pre-computation");
+    }
+    if (!(dt_ > 0.0)) {
+      throw std::invalid_argument("Ocs2SystemEulerDynamics requires positive dt");
+    }
+  }
+
+  Ocs2SystemEulerDynamics(const Ocs2SystemEulerDynamics& rhs)
+      : Base(rhs.space_, rhs.nu),
+        dynamics_(rhs.dynamics_ ? rhs.dynamics_->clone() : nullptr),
+        preComputation_(rhs.preComputation_),
+        time_(rhs.time_),
+        dt_(rhs.dt_) {}
+
+  void forward(const ConstVectorRef& x, const ConstVectorRef& u, Data& data) const override {
+    const Eigen::VectorXd xVec = x;
+    const Eigen::VectorXd uVec = u;
+    preComputation_->request(ocs2::Request::Dynamics, time_, xVec, uVec);
+    data.xnext_ = xVec;
+    data.xnext_.noalias() += dt_ * dynamics_->computeFlowMap(time_, xVec, uVec, *preComputation_);
+  }
+
+  void dForward(const ConstVectorRef& x, const ConstVectorRef& u, Data& data) const override {
+    const Eigen::VectorXd xVec = x;
+    const Eigen::VectorXd uVec = u;
+    preComputation_->request(ocs2::Request::Dynamics + ocs2::Request::Approximation, time_, xVec, uVec);
+    const ocs2::VectorFunctionLinearApproximation linearization =
+        dynamics_->linearApproximation(time_, xVec, uVec, *preComputation_);
+    data.xnext_ = xVec;
+    data.xnext_.noalias() += dt_ * linearization.f;
+    data.Jx().setIdentity();
+    data.Jx().noalias() += dt_ * linearization.dfdx;
+    data.Ju().noalias() = dt_ * linearization.dfdu;
+  }
+
+ private:
+  std::unique_ptr<ocs2::SystemDynamicsBase> dynamics_;
+  ocs2::PreComputation* preComputation_{nullptr};
+  double time_{0.0};
+  double dt_{0.0};
+};
+
 struct ProblemBundle {
   TrajOptProblem problem;
   std::vector<Eigen::VectorXd> xsInit;
   std::vector<Eigen::VectorXd> usInit;
+  std::vector<std::unique_ptr<ocs2::PreComputation>> preComputations;
 
-  ProblemBundle(TrajOptProblem&& p, std::vector<Eigen::VectorXd>&& xs, std::vector<Eigen::VectorXd>&& us)
-      : problem(std::move(p)), xsInit(std::move(xs)), usInit(std::move(us)) {}
+  ProblemBundle(TrajOptProblem&& p, std::vector<Eigen::VectorXd>&& xs, std::vector<Eigen::VectorXd>&& us,
+                std::vector<std::unique_ptr<ocs2::PreComputation>>&& preComp = {})
+      : problem(std::move(p)), xsInit(std::move(xs)), usInit(std::move(us)), preComputations(std::move(preComp)) {}
 };
 
 ProblemBundle buildLayer1Problem(const Options& options, const Layer1References& refs,
@@ -557,7 +829,10 @@ ProblemBundle buildLayer1Problem(const Options& options, const Layer1References&
       const IntegratorEuler discreteDynamics(ode, options.dt);
       stages.emplace_back(StageModel(runningCost, discreteDynamics));
     } else {
-      const DirectQuadraticStateInputCost runningCost(space, nu, refs.xRef, refs.uRef, options.dt * refs.q, options.dt * refs.r);
+      const DirectStageCostContext costContext{static_cast<double>(k) * options.dt, options.dt, nullptr, nullptr};
+      const DirectStageCostPackAligatorCost runningCost(
+          space, nu, costContext,
+          humanoid_cd_nmpc_aligator::makeLayer2AQuadraticRunningPack(refs.xRef, refs.uRef, refs.q, refs.r));
       const DirectCentroidalEulerDynamics discreteDynamics(space, nu, dynamics, static_cast<double>(k) * options.dt, options.dt);
       if (options.frontend == FrontendMode::Thin) {
         stages.emplace_back(ThinCentroidalStageModel(runningCost, discreteDynamics));
@@ -574,8 +849,9 @@ ProblemBundle buildLayer1Problem(const Options& options, const Layer1References&
       legacyTerminalCost.addCost("terminal_state_quadratic", QuadraticStateCost(space, nu, refs.xRef, refs.qFinal));
       return legacyTerminalCost;
     }
-    return DirectQuadraticStateInputCost(space, nu, refs.xRef, Eigen::VectorXd::Zero(nu), refs.qFinal,
-                                         Eigen::MatrixXd::Zero(nu, nu));
+    const DirectStageCostContext terminalContext{static_cast<double>(options.horizon) * options.dt, 1.0, nullptr, nullptr};
+    return DirectStageCostPackAligatorCost(
+        space, nu, terminalContext, humanoid_cd_nmpc_aligator::makeLayer2ATerminalPack(refs.xRef, refs.qFinal));
   }();
 
   TrajOptProblem problem(refs.xRef, stages, terminalCost);
@@ -591,12 +867,108 @@ ProblemBundle buildLayer1Problem(const Options& options, const Layer1References&
   return ProblemBundle(std::move(problem), std::move(xsInit), std::move(usInit));
 }
 
+std::unique_ptr<ocs2::PreComputation> clonePreComputation(const ocs2::OptimalControlProblem& ocp) {
+  if (ocp.preComputationPtr) {
+    return std::unique_ptr<ocs2::PreComputation>(ocp.preComputationPtr->clone());
+  }
+  return std::make_unique<ocs2::PreComputation>();
+}
+
+humanoid_cd_nmpc_aligator::DirectStageCostPack makeStandardRunningCostPack(const ocs2::OptimalControlProblem& ocp) {
+  humanoid_cd_nmpc_aligator::DirectStageCostPack pack;
+  pack.addTerm(std::make_unique<humanoid_cd_nmpc_aligator::Ocs2StateInputCostCollectionTerm>(
+      "ocs2_running_cost_collection", std::unique_ptr<ocs2::StateInputCostCollection>(ocp.costPtr->clone())));
+  pack.addTerm(std::make_unique<humanoid_cd_nmpc_aligator::Ocs2StateInputCostCollectionTerm>(
+      "ocs2_soft_constraint_collection", std::unique_ptr<ocs2::StateInputCostCollection>(ocp.softConstraintPtr->clone())));
+  pack.addTerm(std::make_unique<humanoid_cd_nmpc_aligator::Ocs2StateCostCollectionTerm>(
+      "ocs2_state_soft_constraint_collection", std::unique_ptr<ocs2::StateCostCollection>(ocp.stateSoftConstraintPtr->clone()), true));
+  return pack;
+}
+
+humanoid_cd_nmpc_aligator::DirectStageCostPack makeStandardTerminalCostPack(const ocs2::OptimalControlProblem& ocp) {
+  humanoid_cd_nmpc_aligator::DirectStageCostPack pack;
+  pack.addTerm(std::make_unique<humanoid_cd_nmpc_aligator::Ocs2StateCostCollectionTerm>(
+      "ocs2_terminal_cost_collection", std::unique_ptr<ocs2::StateCostCollection>(ocp.finalCostPtr->clone()), false));
+  return pack;
+}
+
+humanoid_cd_nmpc_aligator::DirectConstraintPack makeStandardEqualityConstraintPack(const ocs2::OptimalControlProblem& ocp) {
+  humanoid_cd_nmpc_aligator::DirectConstraintPack pack;
+  pack.addTerm(std::make_unique<humanoid_cd_nmpc_aligator::Ocs2StateInputEqualityConstraintCollectionTerm>(
+      "ocs2_equality_constraint_collection",
+      std::unique_ptr<ocs2::StateInputConstraintCollection>(ocp.equalityConstraintPtr->clone())));
+  return pack;
+}
+
+ProblemBundle buildStandardProblem(const Options& options, const Layer1References& refs,
+                                   const ocs2::OptimalControlProblem& standardOcp,
+                                   const ocs2::TargetTrajectories& targetTrajectories) {
+  if (!standardOcp.dynamicsPtr) {
+    throw std::invalid_argument("Standard OCS2 problem has no dynamics");
+  }
+
+  const int nx = static_cast<int>(refs.xRef.size());
+  const int nu = static_cast<int>(refs.uRef.size());
+  const VectorSpace space(nx);
+
+  std::vector<std::unique_ptr<ocs2::PreComputation>> preComputations;
+  preComputations.reserve(static_cast<std::size_t>(options.horizon) + 1);
+
+  std::vector<xyz::polymorphic<StageModel>> stages;
+  stages.reserve(static_cast<std::size_t>(options.horizon));
+  for (int k = 0; k < options.horizon; ++k) {
+    preComputations.push_back(clonePreComputation(standardOcp));
+    ocs2::PreComputation* preComp = preComputations.back().get();
+    const double time = static_cast<double>(k) * options.dt;
+
+    const DirectStageCostContext costContext{time, options.dt, &targetTrajectories, preComp, false};
+    const DirectStageCostPackAligatorCost runningCost(space, nu, costContext, makeStandardRunningCostPack(standardOcp));
+    const Ocs2SystemEulerDynamics discreteDynamics(
+        space, nu, std::unique_ptr<ocs2::SystemDynamicsBase>(standardOcp.dynamicsPtr->clone()), preComp, time, options.dt);
+    StageModel stage(runningCost, discreteDynamics);
+
+    auto equalityPack = makeStandardEqualityConstraintPack(standardOcp);
+    const DirectConstraintContext constraintContext{time, preComp};
+    const DirectConstraintPackAligatorFunction equalityConstraint(nx, nu, constraintContext, std::move(equalityPack));
+    if (equalityConstraint.nr > 0) {
+      stage.addConstraint(equalityConstraint, aligator::EqualityConstraintTpl<double>());
+    }
+
+    stages.emplace_back(stage);
+  }
+
+  preComputations.push_back(clonePreComputation(standardOcp));
+  ocs2::PreComputation* terminalPreComp = preComputations.back().get();
+  const DirectStageCostContext terminalContext{
+      static_cast<double>(options.horizon) * options.dt, 1.0, &targetTrajectories, terminalPreComp, true};
+  xyz::polymorphic<aligator::CostAbstractTpl<double>> terminalCost =
+      DirectStageCostPackAligatorCost(space, nu, terminalContext, makeStandardTerminalCostPack(standardOcp));
+
+  TrajOptProblem problem(refs.xRef, stages, terminalCost);
+  problem.setInitState(refs.xRef);
+
+  std::vector<Eigen::VectorXd> xsInit(static_cast<std::size_t>(options.horizon) + 1, refs.xRef);
+  std::vector<Eigen::VectorXd> usInit(static_cast<std::size_t>(options.horizon), refs.uRef);
+  std::unique_ptr<ocs2::SystemDynamicsBase> rolloutDynamics(standardOcp.dynamicsPtr->clone());
+  std::unique_ptr<ocs2::PreComputation> rolloutPreComp = clonePreComputation(standardOcp);
+  for (int k = 0; k < options.horizon; ++k) {
+    const double time = static_cast<double>(k) * options.dt;
+    rolloutPreComp->request(ocs2::Request::Dynamics, time, xsInit[static_cast<std::size_t>(k)], refs.uRef);
+    xsInit[static_cast<std::size_t>(k + 1)] =
+        xsInit[static_cast<std::size_t>(k)] +
+        options.dt * rolloutDynamics->computeFlowMap(time, xsInit[static_cast<std::size_t>(k)], refs.uRef, *rolloutPreComp);
+  }
+
+  return ProblemBundle(std::move(problem), std::move(xsInit), std::move(usInit), std::move(preComputations));
+}
+
 ocs2::TargetTrajectories makeTargetTrajectories(const Options& options, const Layer1References& refs) {
   const double finalTime = static_cast<double>(options.horizon) * options.dt;
   return ocs2::TargetTrajectories({0.0, finalTime}, {refs.xRef, refs.xRef}, {refs.uRef, refs.uRef});
 }
 
-ocs2::PrimalSolution makeOcs2InitialPrimal(const Options& options, const ProblemBundle& bundle) {
+ocs2::PrimalSolution makeOcs2InitialPrimal(const Options& options, const ProblemBundle& bundle,
+                                           ocs2::ModeSchedule modeSchedule = ocs2::ModeSchedule({}, {0})) {
   ocs2::PrimalSolution primal;
   primal.timeTrajectory_.reserve(static_cast<std::size_t>(options.horizon) + 1);
   for (int k = 0; k <= options.horizon; ++k) {
@@ -608,7 +980,7 @@ ocs2::PrimalSolution makeOcs2InitialPrimal(const Options& options, const Problem
     primal.inputTrajectory_.push_back(u);
   }
   primal.inputTrajectory_.push_back(bundle.usInit.back());
-  primal.modeSchedule_ = ocs2::ModeSchedule({}, {0});
+  primal.modeSchedule_ = std::move(modeSchedule);
   return primal;
 }
 
@@ -656,6 +1028,43 @@ SqpRunResult runOcs2SqpLayer1(const Options& options, const Layer1References& re
   solver.setReferenceManager(referenceManager);
 
   const ocs2::PrimalSolution primalGuess = makeOcs2InitialPrimal(options, initialGuess);
+  const double finalTime = static_cast<double>(options.horizon) * options.dt;
+  const auto start = Clock::now();
+  solver.run(0.0, refs.xRef, 0, finalTime, primalGuess);
+  const auto end = Clock::now();
+
+  SqpRunResult result;
+  result.totalMs = msSince(start, end);
+  result.benchmarks = solver.getBenchmarks();
+  result.iterations = solver.getNumIterations();
+  result.performance = solver.getPerformanceIndeces();
+  solver.getPrimalSolution(finalTime, &result.solution);
+  return result;
+}
+
+SqpRunResult runOcs2SqpStandard(const Options& options, const Layer1References& refs,
+                                const ocs2::OptimalControlProblem& standardOcp,
+                                const ocs2::Initializer& initializer,
+                                const std::shared_ptr<ocs2::ReferenceManagerInterface>& referenceManager,
+                                const ProblemBundle& initialGuess) {
+  ocs2::sqp::Settings settings = ocs2::sqp::loadSettings(options.taskFile, "multiple_shooting", false);
+  settings.dt = options.dt;
+  settings.sqpIteration = static_cast<std::size_t>(options.sqpIterations);
+  settings.deltaTol = options.tolerance;
+  settings.integratorType = ocs2::SensitivityIntegratorType::EULER;
+  settings.nThreads = static_cast<std::size_t>(options.threads);
+  settings.printSolverStatus = options.solverVerbose;
+  settings.printSolverStatistics = options.solverVerbose;
+  settings.printLinesearch = options.solverVerbose;
+  settings.enableLogging = false;
+  settings.useFeedbackPolicy = false;
+  settings.createValueFunction = false;
+
+  ocs2::SqpSolver solver(settings, standardOcp, initializer);
+  solver.setReferenceManager(referenceManager);
+
+  const ocs2::PrimalSolution primalGuess =
+      makeOcs2InitialPrimal(options, initialGuess, referenceManager->getModeSchedule());
   const double finalTime = static_cast<double>(options.horizon) * options.dt;
   const auto start = Clock::now();
   solver.run(0.0, refs.xRef, 0, finalTime, primalGuess);
@@ -722,12 +1131,15 @@ int main(int argc, char** argv) {
   try {
     const Options options = parseOptions(argc, argv);
     std::cout << std::boolalpha;
-    std::cout << "[layer1] task=" << options.taskFile << "\n"
-              << "[layer1] urdf=" << options.urdfFile << "\n"
-              << "[layer1] reference=" << options.referenceFile << "\n"
-              << "[layer1] codegen_dir=" << options.codegenDir
+    const char* label = problemModeName(options.problemMode);
+    std::cout << "[" << label << "] task=" << options.taskFile << "\n"
+              << "[" << label << "] urdf=" << options.urdfFile << "\n"
+              << "[" << label << "] reference=" << options.referenceFile << "\n"
+              << "[" << label << "] codegen_dir=" << options.codegenDir
               << " recompile=" << options.recompileCodegen
-              << " frontend=" << frontendModeName(options.frontend) << "\n";
+              << " problem=" << problemModeName(options.problemMode)
+              << " frontend=" << frontendModeName(options.frontend)
+              << " rollout=" << rolloutModeName(options.rollout) << "\n";
 
     const auto modelStart = Clock::now();
     ocs2::humanoid::ModelSettings modelSettings(options.taskFile, options.urdfFile, "centroidal_mpc_", options.verbose);
@@ -749,14 +1161,30 @@ int main(int argc, char** argv) {
 
     const auto buildStart = Clock::now();
     const Layer1References refs = makeLayer1References(options, info, x0);
-    ProblemBundle bundle = buildLayer1Problem(options, refs, dynamics);
+    std::unique_ptr<StandardOcs2Bundle> standardBundle;
+    std::unique_ptr<ocs2::TargetTrajectories> standardTargetTrajectories;
+    ProblemBundle bundle = [&]() {
+      if (options.problemMode == ProblemMode::Layer1) {
+        return buildLayer1Problem(options, refs, dynamics);
+      }
+
+      standardBundle = std::make_unique<StandardOcs2Bundle>(
+          buildStandardOcs2Bundle(options, modelSettings, pinocchioInterface, info));
+      standardTargetTrajectories = std::make_unique<ocs2::TargetTrajectories>(makeTargetTrajectories(options, refs));
+      auto referenceManager = standardBundle->referenceManager;
+      referenceManager->setTargetTrajectories(*standardTargetTrajectories);
+      referenceManager->preSolverRun(0.0, static_cast<double>(options.horizon) * options.dt, refs.xRef, 0);
+      *standardTargetTrajectories = referenceManager->getTargetTrajectories();
+      return buildStandardProblem(options, refs, standardBundle->problem, *standardTargetTrajectories);
+    }();
     const auto buildEnd = Clock::now();
 
     const double rawCodegenLinearizationMs = benchmarkRawCodegenLinearizationMs(options, dynamics, bundle, 10);
 
     SolverProxDDP solver(options.tolerance, options.muInit, static_cast<std::size_t>(options.maxIterations),
                          options.solverVerbose ? aligator::VERBOSE : aligator::QUIET);
-    solver.rollout_type_ = aligator::RolloutType::LINEAR;
+    solver.rollout_type_ =
+        options.rollout == RolloutMode::Nonlinear ? aligator::RolloutType::NONLINEAR : aligator::RolloutType::LINEAR;
     solver.linear_solver_choice = aligator::LQSolverChoice::SERIAL;
     solver.force_initial_condition_ = true;
     solver.max_al_iters = static_cast<std::size_t>(options.maxAlIterations);
@@ -771,7 +1199,12 @@ int main(int argc, char** argv) {
     const auto solveEnd = Clock::now();
 
     const auto sqpStart = Clock::now();
-    const SqpRunResult sqpResult = runOcs2SqpLayer1(options, refs, dynamics, bundle);
+    ocs2::OperatingPoints standardInitializer(refs.xRef, refs.uRef);
+    const SqpRunResult sqpResult =
+        options.problemMode == ProblemMode::Standard
+            ? runOcs2SqpStandard(options, refs, standardBundle->problem, standardInitializer,
+                                 standardBundle->referenceManager, bundle)
+            : runOcs2SqpLayer1(options, refs, dynamics, bundle);
     const auto sqpEnd = Clock::now();
 
     const Eigen::VectorXd u0 = solver.results_.us.empty() ? bundle.usInit.front() : solver.results_.us.front();
@@ -779,19 +1212,19 @@ int main(int argc, char** argv) {
     const Eigen::VectorXd sqpU0 = sqpResult.solution.inputTrajectory_.empty() ? bundle.usInit.front() : sqpResult.solution.inputTrajectory_.front();
     const Eigen::VectorXd sqpX1 = sqpResult.solution.stateTrajectory_.size() > 1 ? sqpResult.solution.stateTrajectory_[1] : bundle.xsInit[1];
 
-    std::cout << "[layer1] model dims"
+    std::cout << "[" << label << "] model dims"
               << " nx=" << info.stateDim
               << " nu=" << info.inputDim
               << " contacts3=" << info.numThreeDofContacts
               << " contacts6=" << info.numSixDofContacts
               << " mass=" << info.robotMass << "\n";
-    std::cout << "[layer1] horizon"
+    std::cout << "[" << label << "] horizon"
               << " N=" << options.horizon
               << " dt=" << options.dt
               << " threads=" << options.threads
               << " proxddp_max_iters=" << options.maxIterations
               << " sqp_iters=" << options.sqpIterations << "\n";
-    std::cout << "[layer1] timing_ms"
+    std::cout << "[" << label << "] timing_ms"
               << " model_load=" << std::fixed << std::setprecision(3) << msSince(modelStart, modelEnd)
               << " codegen_load=" << msSince(codegenStart, codegenEnd)
               << " build_problem=" << msSince(buildStart, buildEnd)
@@ -807,7 +1240,7 @@ int main(int argc, char** argv) {
               << " sqp_linesearch=" << sqpResult.benchmarks.linesearchTime
               << " sqp_controller=" << sqpResult.benchmarks.computeControllerTime << "\n";
     std::cout << std::scientific
-              << "[layer1] proxddp"
+              << "[" << label << "] proxddp"
               << " run_return=" << converged
               << " converged=" << solver.results_.conv
               << " iter=" << solver.results_.num_iters
@@ -817,7 +1250,7 @@ int main(int argc, char** argv) {
               << " prim=" << solver.results_.prim_infeas
               << " dual=" << solver.results_.dual_infeas << "\n";
     std::cout << std::scientific
-              << "[layer1] ocs2_sqp"
+              << "[" << label << "] ocs2_sqp"
               << " iter=" << sqpResult.iterations
               << " cost=" << sqpResult.performance.cost
               << " merit=" << sqpResult.performance.merit
@@ -825,21 +1258,22 @@ int main(int argc, char** argv) {
               << " eq_sse=" << sqpResult.performance.equalityConstraintsSSE
               << " ineq_sse=" << sqpResult.performance.inequalityConstraintsSSE << "\n";
     std::cout << std::scientific
-              << "[layer1] strict_diff"
+              << "[" << label << "] strict_diff"
               << " cost_abs=" << std::abs(solver.results_.traj_cost_ - sqpResult.performance.cost)
               << " first_u_inf=" << maxAbsDiff(u0, sqpU0)
               << " next_x_inf=" << maxAbsDiff(x1, sqpX1)
-              << " math_ocp=same"
+              << " math_ocp=" << (options.problemMode == ProblemMode::Standard ? "ocs2_standard_collections" : "same")
               << " aligator_frontend=" << frontendModeName(options.frontend)
+              << " aligator_rollout=" << rolloutModeName(options.rollout)
               << " ocs2_frontend=sqp_direct" << "\n";
     std::cout << std::fixed << std::setprecision(4)
-              << "[layer1] first_u=" << vecHeadString(u0, 12) << "\n"
-              << "[layer1] next_x=" << vecHeadString(x1, 12) << "\n"
-              << "[layer1] sqp_first_u=" << vecHeadString(sqpU0, 12) << "\n"
-              << "[layer1] sqp_next_x=" << vecHeadString(sqpX1, 12) << "\n";
+              << "[" << label << "] first_u=" << vecHeadString(u0, 12) << "\n"
+              << "[" << label << "] next_x=" << vecHeadString(x1, 12) << "\n"
+              << "[" << label << "] sqp_first_u=" << vecHeadString(sqpU0, 12) << "\n"
+              << "[" << label << "] sqp_next_x=" << vecHeadString(sqpX1, 12) << "\n";
     return solver.results_.us.empty() || solver.results_.xs.empty() || sqpResult.solution.inputTrajectory_.empty() ? 2 : 0;
   } catch (const std::exception& e) {
-    std::cerr << "[layer1] ERROR: " << e.what() << "\n";
+    std::cerr << "[proxddp_centroidal] ERROR: " << e.what() << "\n";
     return 1;
   }
 }
