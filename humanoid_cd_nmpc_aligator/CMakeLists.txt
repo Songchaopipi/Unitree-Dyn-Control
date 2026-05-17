@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(OPENLOONG_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." CACHE PATH
-    "Path to OpenLoong-Dyn-Control. Used for bundled aligator, Eigen, Pinocchio, and shims.")
+    "Path to OpenLoong-Dyn-Control. Used for bundled aligator, Eigen, and shims.")
 get_filename_component(OPENLOONG_ROOT "${OPENLOONG_ROOT}" ABSOLUTE)
 set(WB_HUMANOID_MPC_WS "/home/songchao/OPTControl_env/wb_humanoid_mpc_ws" CACHE PATH
     "Path to wb_humanoid_mpc_ws. Used for G1 config and URDF defaults.")
@@ -45,17 +45,6 @@ set(INSTALL_DOCUMENTATION OFF CACHE BOOL "" FORCE)
 set(fmt_DIR "/usr/lib/x86_64-linux-gnu/cmake/fmt" CACHE PATH "" FORCE)
 set(pinocchio_DIR "${OPENLOONG_ROOT}/cmake/shims/pinocchio" CACHE PATH "" FORCE)
 add_subdirectory("${OPENLOONG_ROOT}/third_party/aligator" "${CMAKE_BINARY_DIR}/aligator" EXCLUDE_FROM_ALL)
-
-if(CMAKE_CXX_COMPILER MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-  set(OPENLOONG_LIB_SUFFIX "lin_arm64")
-else()
-  set(OPENLOONG_LIB_SUFFIX "lin_x64")
-endif()
-
-set(OPENLOONG_PINOCCHIO_ARCHIVE "${OPENLOONG_ROOT}/third_party/pinocchio/libpinocchio_${OPENLOONG_LIB_SUFFIX}.a")
-if(NOT EXISTS "${OPENLOONG_PINOCCHIO_ARCHIVE}")
-  message(FATAL_ERROR "Cannot find OpenLoong Pinocchio archive: ${OPENLOONG_PINOCCHIO_ARCHIVE}")
-endif()
 
 set(SYSTEM_PINOCCHIO_DEFAULT "/usr/local/lib/libpinocchio_default.so" CACHE FILEPATH
     "System Pinocchio default library used by the prebuilt OCS2 centroidal libraries.")
@@ -108,10 +97,7 @@ set(OCS2_SHARED_LIBS
   "${CENTROIDAL_NMPC_ROOT}/blasfeo_catkin/lib/libblasfeo.so"
 )
 
-link_directories(
-  "${OPENLOONG_ROOT}/third_party/pinocchio"
-  "${OPENLOONG_ROOT}/third_party/urdfdom"
-)
+link_directories("${OPENLOONG_ROOT}/third_party/urdfdom")
 
 add_executable(proxddp_centroidal_layer1
   src/proxddp_centroidal_layer1.cpp
@@ -121,7 +107,6 @@ target_include_directories(proxddp_centroidal_layer1 PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/include"
   "${OPENLOONG_ROOT}/third_party/eigen3"
   "/usr/local/include"
-  "${OPENLOONG_ROOT}/third_party/boost"
   "${OPENLOONG_ROOT}/third_party/quill/quill/bundled"
   ${OCS2_INCLUDE_DIRS}
 )

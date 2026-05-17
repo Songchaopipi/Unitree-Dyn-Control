@@ -25,3 +25,7 @@ ffmpeg -f rawvideo -pixel_format rgb24 -video_size 1200x800 -framerate 60 -i rec
 ./build/g1_cd_nmpc_ik_stand --duration 13.0 --print --print-hz 1
 
 ./g1_kino_nmpc_id_stand --duration 13.0 --print --print-hz 1.0
+./g1_kino_nmpc_id_alip_walk --duration 13.0 --print --print-hz 1.0 --  --nmpc-ls-max-steps 1 --nmpc-threads 4 --nmpc-fast-parallel
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target g1_kino_nmpc_id_alip_walk -j$(nproc)

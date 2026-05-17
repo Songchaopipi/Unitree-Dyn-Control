@@ -181,5 +181,7 @@ build/
 cppad_code_gen/
 
 record/datalog.log
+record/*.log
+record/matlabReadDataScript.txt
 
 .vscode/

@@ -10,7 +10,6 @@ add_compile_definitions(GLFW_INCLUDE_NONE)
 # Build only the maintained walking demos and their shared control code.
 set(dirEigen "third_party/eigen3")
 set(dirGlfw "third_party/glfw")
-set(dirPino "third_party/pinocchio")
 set(dirJson "third_party/jsoncpp")
 set(dirQuill "third_party/quill")
 set(dirAligator "third_party/aligator")
@@ -22,12 +21,13 @@ set(incBoost "third_party/boost")
 set(incMujoco "third_party/mujoco")
 set(incQP "third_party/qpOASES")
 
-set(allDir ${dirEigen} ${dirGlfw} ${dirPino} ${dirJson} ${dirQuill})
+set(allDir ${dirEigen} ${dirGlfw} ${dirJson} ${dirQuill})
 set(allLib ${allDir} ${libURDF})
-set(allInc ${allDir} ${incFmt} ${incBoost} ${incMujoco} ${incQP})
+set(allInc ${allDir} ${incFmt} ${incMujoco} ${incQP})
 
 include_directories(${allInc})
 include_directories("${dirAligator}/include")
+include_directories("prox_ddp")
 include_directories("algorithm")
 include_directories("common")
 include_directories("math")
@@ -45,7 +45,7 @@ endif()
 link_directories(${allLib})
 
 set(BUILD_WITH_PINOCCHIO_SUPPORT ON CACHE BOOL "" FORCE)
-set(BUILD_WITH_OPENMP_SUPPORT OFF CACHE BOOL "" FORCE)
+set(BUILD_WITH_OPENMP_SUPPORT ON CACHE BOOL "" FORCE)
 set(BUILD_WITH_MIMALLOC OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -56,13 +56,47 @@ set(fmt_DIR "/usr/lib/x86_64-linux-gnu/cmake/fmt" CACHE PATH "" FORCE)
 set(pinocchio_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/shims/pinocchio" CACHE PATH "" FORCE)
 add_subdirectory(${dirAligator} EXCLUDE_FROM_ALL)
 
+if(NOT TARGET pinocchio::pinocchio_headers)
+	add_library(pinocchio::pinocchio_headers INTERFACE IMPORTED)
+	set_target_properties(pinocchio::pinocchio_headers PROPERTIES
+		INTERFACE_INCLUDE_DIRECTORIES "/usr/local/include")
+endif()
+if(NOT TARGET pinocchio::pinocchio_default)
+	add_library(pinocchio::pinocchio_default SHARED IMPORTED)
+	set_target_properties(pinocchio::pinocchio_default PROPERTIES
+		IMPORTED_LOCATION "/usr/local/lib/libpinocchio_default.so"
+		INTERFACE_LINK_LIBRARIES "pinocchio::pinocchio_headers")
+endif()
+if(NOT TARGET pinocchio::pinocchio_parsers)
+	add_library(pinocchio::pinocchio_parsers SHARED IMPORTED)
+	set_target_properties(pinocchio::pinocchio_parsers PROPERTIES
+		IMPORTED_LOCATION "/usr/local/lib/libpinocchio_parsers.so"
+		INTERFACE_LINK_LIBRARIES "pinocchio::pinocchio_default")
+endif()
+if(NOT TARGET pinocchio::pinocchio)
+	add_library(pinocchio::pinocchio INTERFACE IMPORTED)
+	set_target_properties(pinocchio::pinocchio PROPERTIES
+		INTERFACE_LINK_LIBRARIES "pinocchio::pinocchio_default;pinocchio::pinocchio_parsers")
+endif()
+if(NOT TARGET pinocchio::pinocchio_collision)
+	add_library(pinocchio::pinocchio_collision INTERFACE IMPORTED)
+endif()
+
 file(GLOB C_SOURCES *.c)
 set(CPP_SOURCES
 	algorithm/Eul_W_filter.cpp
 	algorithm/StateEst.cpp
 	algorithm/foot_placement.cpp
 	algorithm/g1_centroidal_nmpc.cpp
-	algorithm/g1_kinodynamics_nmpc.cpp
+	prox_ddp/detail/control_slice.cpp
+	prox_ddp/detail/direct_kino_costs.cpp
+	prox_ddp/detail/kino_weights.cpp
+	prox_ddp/detail/mutable_contact_constraints.cpp
+	prox_ddp/detail/semi_implicit_kinodynamics.cpp
+	prox_ddp/g1_kinodynamics_nmpc.cpp
+	prox_ddp/g1_kinodynamics_nmpc_problem.cpp
+	prox_ddp/g1_kinodynamics_nmpc_solve.cpp
+	prox_ddp/g1_kinodynamics_nmpc_warm_start.cpp
 	algorithm/g1_srbd_mpc.cpp
 	algorithm/g1_srbd_mpc_rp.cpp
 	algorithm/g1_srbd_mpc_rp_enhanced.cpp
@@ -84,7 +118,7 @@ set(CPP_SOURCES
 set(SOURCES ${C_SOURCES} ${CPP_SOURCES})
 
 #链接库
-set(corLibs pinocchio urdfdom_model tinyxml console_bridge jsoncpp quill)
+set(corLibs urdfdom_model tinyxml console_bridge jsoncpp quill)
 set(simLibs glfw3)#mujoco区分x86/arm的方式不一样，在上面按link目录区分
 
 #根据架构，处理连接库
@@ -112,7 +146,7 @@ message(${sysCoreLibs})
 
 #生成控制核心库
 add_library(core ${SOURCES})
-target_link_libraries(core ${sysCoreLibs} aligator::aligator pthread)
+target_link_libraries(core pinocchio::pinocchio ${sysCoreLibs} aligator::aligator pthread)
 
 
 #生成仿真可执行文件
@@ -137,5 +171,8 @@ target_link_libraries(g1_cd_nmpc_ik_walk core mujoco qpOASES ${sysSimLibs} dl)
 add_executable(g1_cd_nmpc_wbc_walk demo/g1_cd_nmpc_wbc_walk.cpp)
 target_link_libraries(g1_cd_nmpc_wbc_walk core mujoco qpOASES ${sysSimLibs} dl)
 
-add_executable(g1_kino_nmpc_id_stand demo/g1_kino_nmpc_id_stand.cpp)
+add_executable(g1_kino_nmpc_id_stand prox_ddp/demo/g1_kino_nmpc_id_stand.cpp)
 target_link_libraries(g1_kino_nmpc_id_stand core mujoco qpOASES ${sysSimLibs} dl)
+
+add_executable(g1_kino_nmpc_id_alip_walk prox_ddp/demo/g1_kino_nmpc_id_alip_walk.cpp)
+target_link_libraries(g1_kino_nmpc_id_alip_walk core mujoco qpOASES ${sysSimLibs} dl)
