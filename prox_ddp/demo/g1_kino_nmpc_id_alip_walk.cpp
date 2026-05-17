@@ -27,6 +27,7 @@ Feel free to use in any purpose, and cite OpenLoong-Dynamics-Control in any styl
 #include "foot_placement.h"
 #include "../g1_kinodynamics_nmpc.h"
 #include "gait_scheduler.h"
+#include "joystick_interpreter.h"
 #include "pino_kin_dyn.h"
 #include "useful_math.h"
 
@@ -34,7 +35,7 @@ namespace
 {
 constexpr int kTotalMotorDof = 29;
 constexpr int kLegMotorCount = 12;
-constexpr int kDefaultHorizon = 12;
+constexpr int kDefaultHorizon = 10;
 constexpr int kDefaultMpcSolveEveryIterations = 5;
 constexpr double kDefaultMpcSegmentDt = 0.02;
 constexpr double kDefaultSingleSupportTime = 0.3;
@@ -44,6 +45,24 @@ constexpr double kFeedforwardRampTime = 0.0;
 constexpr double kDefaultPrintHz = 1.0;
 constexpr double kPreWalkStanceShiftY = 0.035;
 constexpr double kIkRampTime = 0.5;
+constexpr double kDoubleSupportTangentialLimit = 10.0;
+constexpr double kSingleSupportTangentialLimit = 6.0;
+constexpr double kDoubleSupportRollMomentLimit = 0.8;
+constexpr double kDoubleSupportPitchMomentLimit = 2.0;
+constexpr double kDoubleSupportYawMomentLimit = 0.5;
+constexpr double kSingleSupportRollMomentLimit = 0.5;
+constexpr double kSingleSupportPitchMomentLimit = 1.0;
+constexpr double kSingleSupportYawMomentLimit = 0.3;
+constexpr int kWaistRollMotor = 13;
+constexpr int kWaistPitchMotor = 14;
+constexpr double kWaistRollKp = 260.0;
+constexpr double kWaistRollKd = 18.0;
+constexpr double kWaistPitchKp = 120.0;
+constexpr double kWaistPitchKd = 8.0;
+constexpr double kWaistRollLimit = 12.0;
+constexpr double kWaistPitchLimit = 8.0;
+constexpr double kMaxComReferenceLeadX = 0.14;
+constexpr double kMaxComReferenceLeadY = 0.08;
 
 struct RuntimeOptions
 {
@@ -63,7 +82,7 @@ struct RuntimeOptions
     double mpcSegmentDt{kDefaultMpcSegmentDt};
     double singleSupportTime{kDefaultSingleSupportTime};
     double doubleSupportTime{kDefaultDoubleSupportTime};
-    double vx{0.08};
+    double vx{0.15};
     double vy{0.0};
     double yawRate{0.0};
     double velocityRamp{2.0};
@@ -73,13 +92,15 @@ struct RuntimeOptions
     double wrenchSign{-1.0};
     double nmpcTolerance{1e-5};
     double nmpcMuInit{1e-8};
-    int nmpcMaxIterations{1};
+    int nmpcMaxIterations{2};
     int nmpcMaxAlIterations{2};
     double nmpcLineSearchAlphaMin{1e-3};
     int nmpcMaxLineSearchSteps{2};
     int nmpcThreads{1};
     bool nmpcLinearRollout{false};
     bool nmpcParallelLq{false};
+    bool nmpcTiming{false};
+    bool printAlipFootstep{true};
     double printHz{kDefaultPrintHz};
 };
 
@@ -310,6 +331,20 @@ double smoothStep(double x)
     return u * u * (3.0 - 2.0 * u);
 }
 
+// 函数说明：限制 NMPC 位置参考相对当前 CoM 的超前量，避免开环积分参考跑飞。
+Eigen::Vector3d boundedComTrackingReference(const Eigen::Vector3d &desired,
+                                            const Eigen::Vector3d &current)
+{
+    Eigen::Vector3d out = desired;
+    out.x() = current.x() + std::clamp(desired.x() - current.x(),
+                                       -kMaxComReferenceLeadX,
+                                       kMaxComReferenceLeadX);
+    out.y() = current.y() + std::clamp(desired.y() - current.y(),
+                                       -kMaxComReferenceLeadY,
+                                       kMaxComReferenceLeadY);
+    return out;
+}
+
 // 函数说明：把旋转和平移打包成 Pinocchio SE3。
 pinocchio::SE3 makeFootPose(const Eigen::Matrix3d &rotation, const Eigen::Vector3d &translation)
 {
@@ -402,6 +437,87 @@ Eigen::VectorXd inverseDynamicsFeedforward(const DataBus &robotState,
         tau(i) = std::clamp(tau(i), -limit, limit);
     }
     return tau;
+}
+
+// 函数说明：沿用 CD demo 的腰部 roll/pitch 辅助稳定力矩，抑制连续单支撑时躯干侧翻。
+Eigen::Vector2d waistRpStabilizingTorque(const DataBus &robotState)
+{
+    Eigen::Vector2d tau;
+    tau.x() = -kWaistRollKp * robotState.base_rpy.x() - kWaistRollKd * robotState.base_omega_W.x();
+    tau.y() = -kWaistPitchKp * robotState.base_rpy.y() - kWaistPitchKd * robotState.base_omega_W.y();
+    tau.x() = std::clamp(tau.x(), -kWaistRollLimit, kWaistRollLimit);
+    tau.y() = std::clamp(tau.y(), -kWaistPitchLimit, kWaistPitchLimit);
+    return tau;
+}
+
+// 函数说明：按 CD 行走 demo 的方式统一写入步态总线，保证 IK、NMPC 和落足点规划看到同一套接触/速度状态。
+void fillWalkBus(DataBus &robotState,
+                 const Eigen::Vector3d &comDes,
+                 const Eigen::Vector3d &velDesWorld,
+                 double yawDes,
+                 double yawRateDes,
+                 bool leftContact,
+                 bool rightContact,
+                 double nominalFootForce,
+                 bool walkingMode,
+                 double targetComHeight)
+{
+    robotState.motionState = walkingMode ? DataBus::Walk : DataBus::Stand;
+    robotState.walk_left_contact = leftContact;
+    robotState.walk_right_contact = rightContact;
+    robotState.walk_is_double_support = leftContact && rightContact;
+    if (leftContact && !rightContact)
+    {
+        robotState.legState = DataBus::LSt;
+        robotState.walk_stance_leg = DataBus::LSt;
+        robotState.stance_fe_pos_cur_W = robotState.fe_l_pos_W;
+        robotState.stance_fe_rot_cur_W = robotState.fe_l_rot_W;
+    }
+    else if (rightContact && !leftContact)
+    {
+        robotState.legState = DataBus::RSt;
+        robotState.walk_stance_leg = DataBus::RSt;
+        robotState.stance_fe_pos_cur_W = robotState.fe_r_pos_W;
+        robotState.stance_fe_rot_cur_W = robotState.fe_r_rot_W;
+    }
+    else
+    {
+        robotState.legState = DataBus::DSt;
+        if (!walkingMode)
+        {
+            robotState.walk_stance_leg = DataBus::DSt;
+            robotState.stance_fe_pos_cur_W = 0.5 * (robotState.fe_l_pos_W + robotState.fe_r_pos_W);
+            robotState.stance_fe_rot_cur_W = robotState.fe_l_rot_W;
+        }
+        else if (robotState.walk_stance_leg == DataBus::LSt)
+        {
+            robotState.stance_fe_pos_cur_W = robotState.fe_l_pos_W;
+            robotState.stance_fe_rot_cur_W = robotState.fe_l_rot_W;
+        }
+        else
+        {
+            robotState.stance_fe_pos_cur_W = robotState.fe_r_pos_W;
+            robotState.stance_fe_rot_cur_W = robotState.fe_r_rot_W;
+        }
+    }
+    robotState.walk_target_yaw = yawDes;
+    robotState.walk_target_yaw_rate = yawRateDes;
+    robotState.walk_target_com_height = targetComHeight;
+    robotState.desV_W = velDesWorld;
+    robotState.js_vel_des = velDesWorld;
+    robotState.js_omega_des << 0.0, 0.0, yawRateDes;
+    robotState.base_rpy_des << 0.0, 0.0, yawDes;
+    robotState.base_vel_des = velDesWorld;
+    robotState.base_omega_des << 0.0, 0.0, yawRateDes;
+    robotState.Fr_ff.setZero(12);
+    if (leftContact)
+    {
+        robotState.Fr_ff.segment<6>(0) << 0.0, 0.0, nominalFootForce, 0.0, 0.0, 0.0;
+    }
+    if (rightContact)
+    {
+        robotState.Fr_ff.segment<6>(6) << 0.0, 0.0, nominalFootForce, 0.0, 0.0, 0.0;
+    }
 }
 
 // 函数说明：按当前接触脚数量分配重力补偿 wrench。
@@ -506,6 +622,10 @@ void printRuntimeSummary(double time,
                          const DataBus &robotState,
                          const Eigen::Vector3d &comDes,
                          const Eigen::Vector3d &velDesWorld,
+                         const std::array<Eigen::Vector3d, 2> &footDesW,
+                         const std::array<Eigen::Vector3d, 2> &mpcFootTouchdownW,
+                         const FootPlacement &footPlacement,
+                         bool printAlipFootstep,
                          const G1KinodynamicsNmpc &nmpc,
                          const Eigen::Matrix<double, 12, 1> &wrenches,
                          const Eigen::VectorXd &jointAccelerations,
@@ -514,6 +634,8 @@ void printRuntimeSummary(double time,
                          int stepsDone,
                          bool leftContact,
                          bool rightContact,
+                         int ikStatus,
+                         double ikErrNorm,
                          double ffScale,
                          double wrenchSign)
 {
@@ -545,6 +667,30 @@ void printRuntimeSummary(double time,
     std::cout << "ID ff scale/sign: " << ffScale
               << " / " << (wrenchSign >= 0.0 ? "+1" : "-1")
               << "   joint acc norm: " << jointAccelerations.norm() << "\n";
+    std::cout << "IK status/err: " << ikStatus << " / " << ikErrNorm << "\n";
+    std::cout << "Swing current des L/R: [" << std::setprecision(4)
+              << footDesW[0].x() << ", " << footDesW[0].y() << ", " << footDesW[0].z()
+              << "] / [" << footDesW[1].x() << ", " << footDesW[1].y() << ", "
+              << footDesW[1].z() << "]\n";
+    std::cout << "Swing final/MPC foot L/R: [" << mpcFootTouchdownW[0].x()
+              << ", " << mpcFootTouchdownW[0].y() << ", " << mpcFootTouchdownW[0].z()
+              << "] / [" << mpcFootTouchdownW[1].x() << ", "
+              << mpcFootTouchdownW[1].y() << ", " << mpcFootTouchdownW[1].z() << "]\n";
+    if (printAlipFootstep && footPlacement.hasLastPlan)
+    {
+        std::cout << "ALIP footstep local/baseYaw/world: ["
+                  << footPlacement.lastHlipStepLocal.x() << ", "
+                  << footPlacement.lastHlipStepLocal.y() << "] / ["
+                  << footPlacement.lastPlannedStepBaseYaw.x() << ", "
+                  << footPlacement.lastPlannedStepBaseYaw.y() << "] / ["
+                  << footPlacement.lastPlannedStepWorld.x() << ", "
+                  << footPlacement.lastPlannedStepWorld.y() << ", "
+                  << footPlacement.lastPlannedStepWorld.z() << "]"
+                  << "   touchdown: ["
+                  << footPlacement.lastPlannedTouchdownWorld.x() << ", "
+                  << footPlacement.lastPlannedTouchdownWorld.y() << ", "
+                  << footPlacement.lastPlannedTouchdownWorld.z() << "]\n";
+    }
 
     std::cout << "\nKino-NMPC desired wrench [Fx Fy Fz Mx My Mz]\n";
     std::cout << "  L: "
@@ -713,6 +859,22 @@ RuntimeOptions parseOptions(int argc, const char **argv)
             options.nmpcLinearRollout = true;
             options.nmpcThreads = std::max(options.nmpcThreads, 4);
         }
+        else if (arg == "--nmpc-timing" || arg == "--print-nmpc-timing")
+        {
+            options.nmpcTiming = true;
+        }
+        else if (arg == "--no-nmpc-timing")
+        {
+            options.nmpcTiming = false;
+        }
+        else if (arg == "--print-alip-step" || arg == "--print-footstep")
+        {
+            options.printAlipFootstep = true;
+        }
+        else if (arg == "--no-alip-step" || arg == "--no-footstep-print")
+        {
+            options.printAlipFootstep = false;
+        }
         else if (arg == "--print-hz" && i + 1 < argc)
         {
             options.printHz = std::max(0.05, std::stod(argv[++i]));
@@ -765,6 +927,7 @@ int main(int argc, const char **argv)
     gaitScheduler.doubleSupportTime = options.doubleSupportTime;
     gaitScheduler.stepNumDes = options.demoSteps;
     FootPlacement footPlacement;
+    JoyStickInterpreter jsInterp(simDt);
 
     G1KinodynamicsNmpc nmpc(kinDyn.model_biped,
                             {kinDyn.l_foot_frame, kinDyn.r_foot_frame},
@@ -779,6 +942,8 @@ int main(int argc, const char **argv)
     nmpc.numThreads = options.nmpcThreads;
     nmpc.useLinearRollout = options.nmpcLinearRollout;
     nmpc.useParallelLq = options.nmpcParallelLq;
+    nmpc.constrainStandingFeet = false;
+    nmpc.logTiming = options.nmpcTiming;
 
     DataLogger logger(logPath);
     const std::vector<double> standPoseStd = makeG1StandPose();
@@ -832,7 +997,6 @@ int main(int argc, const char **argv)
         const int actuatedRefSize = std::min<int>(standPose.size(), qRef.size() - 7);
         qRef.segment(7, actuatedRefSize) = standPose.head(actuatedRefSize);
     }
-    const Eigen::VectorXd vRef = Eigen::VectorXd::Zero(robotState.model_nv);
     Eigen::Matrix<double, 12, 1> lastWrenches = Eigen::Matrix<double, 12, 1>::Zero();
     lastWrenches << 0.0, 0.0, nominalFootForce, 0.0, 0.0, 0.0,
         0.0, 0.0, nominalFootForce, 0.0, 0.0, 0.0;
@@ -852,6 +1016,8 @@ int main(int argc, const char **argv)
     logger.addIterm("wrench", 12);
     logger.addIterm("jointAcc", robotState.model_nv - 6);
     logger.addIterm("tau_ff", robotState.model_nv - 6);
+    logger.addIterm("ikStatus", 1);
+    logger.addIterm("ikErrNorm", 1);
     logger.addIterm("nmpcStatus", 1);
     logger.addIterm("nmpcIter", 1);
     logger.addIterm("nmpcCpuTime", 1);
@@ -873,6 +1039,11 @@ int main(int argc, const char **argv)
     double nextPrintTime = 0.0;
     double yawDes = initialYaw;
     Eigen::Vector3d worldComDesired = initialCom;
+    double lastCommandedVx = std::numeric_limits<double>::quiet_NaN();
+    double lastCommandedVy = std::numeric_limits<double>::quiet_NaN();
+    double lastCommandedYawRate = std::numeric_limits<double>::quiet_NaN();
+    int ikStatus = 0;
+    double ikErrNorm = 0.0;
 
     while ((options.headless || !glfwWindowShouldClose(uiController.window)) && mj_data->time < options.duration)
     {
@@ -903,6 +1074,7 @@ int main(int argc, const char **argv)
                 walkingStarted = true;
                 forceMpcSolve = true;
                 worldComDesired = preWalkComDes;
+                worldComDesired.head<2>() = initialCom.head<2>();
                 worldComDesired.z() = targetComZ;
                 yawDes = robotState.base_rpy.z();
                 footHoldW = {robotState.fe_l_pos_W, robotState.fe_r_pos_W};
@@ -914,27 +1086,42 @@ int main(int argc, const char **argv)
                 lastWrenches = nominalContactWrench(true, true, modelMass);
                 lastJointAccelerations.setZero();
                 hasPreviousContactMode = false;
+                jsInterp.setIniPos(robotState.q(0), robotState.q(1), robotState.base_pos.z(), robotState.base_rpy.z());
+                lastCommandedVx = std::numeric_limits<double>::quiet_NaN();
+                lastCommandedVy = std::numeric_limits<double>::quiet_NaN();
+                lastCommandedYawRate = std::numeric_limits<double>::quiet_NaN();
             }
 
             Eigen::Vector3d velDesWorld = Eigen::Vector3d::Zero();
             double yawRateDes = 0.0;
             if (walkingEnabled)
             {
-                const double velocityScale = smoothStep((time - walkStartTime) / options.velocityRamp);
-                yawRateDes = velocityScale * options.yawRate;
-                yawDes += yawRateDes * simDt;
-                velDesWorld = Rz3(yawDes) *
-                              Eigen::Vector3d(velocityScale * options.vx,
-                                              velocityScale * options.vy,
-                                              0.0);
+                if (!std::isfinite(lastCommandedYawRate) ||
+                    std::abs(lastCommandedYawRate - options.yawRate) > 1e-9)
+                {
+                    jsInterp.setWzDesLPara(options.yawRate, 1.0);
+                    lastCommandedYawRate = options.yawRate;
+                }
+                if (!std::isfinite(lastCommandedVx) ||
+                    std::abs(lastCommandedVx - options.vx) > 1e-9)
+                {
+                    jsInterp.setVxDesLPara(options.vx, std::max(1e-3, options.velocityRamp));
+                    lastCommandedVx = options.vx;
+                }
+                if (!std::isfinite(lastCommandedVy) ||
+                    std::abs(lastCommandedVy - options.vy) > 1e-9)
+                {
+                    jsInterp.setVyDesLPara(options.vy, std::max(1e-3, options.velocityRamp));
+                    lastCommandedVy = options.vy;
+                }
+                jsInterp.step();
+                jsInterp.dataBusWrite(robotState);
+                velDesWorld = robotState.js_vel_des;
+                yawRateDes = robotState.js_omega_des.z();
+                yawDes = robotState.base_rpy_des.z();
 
                 robotState.motionState = DataBus::Walk;
-                robotState.js_vel_des = velDesWorld;
-                robotState.js_omega_des << 0.0, 0.0, yawRateDes;
                 robotState.desV_W = velDesWorld;
-                robotState.base_rpy_des << 0.0, 0.0, yawDes;
-                robotState.base_vel_des = velDesWorld;
-                robotState.base_omega_des << 0.0, 0.0, yawRateDes;
                 robotState.walk_target_yaw = yawDes;
                 robotState.walk_target_yaw_rate = yawRateDes;
                 robotState.walk_target_com_height = targetComHeight;
@@ -950,7 +1137,6 @@ int main(int argc, const char **argv)
                 footPlacement.dataBusRead(robotState);
                 footPlacement.getSwingPos();
                 footPlacement.dataBusWrite(robotState);
-                // 说明：保留 FootPlacement/ALIP 原始落足点，避免 demo 层限幅削弱恢复步长。
 
                 worldComDesired.head<2>() += velDesWorld.head<2>() * simDt;
                 worldComDesired.z() = targetComZ;
@@ -958,6 +1144,10 @@ int main(int argc, const char **argv)
             }
             else
             {
+                lastCommandedVx = std::numeric_limits<double>::quiet_NaN();
+                lastCommandedVy = std::numeric_limits<double>::quiet_NaN();
+                lastCommandedYawRate = std::numeric_limits<double>::quiet_NaN();
+                jsInterp.setIniPos(robotState.q(0), robotState.q(1), initialBasePos.z(), robotState.base_rpy.z());
                 comDes = preWalkComDes;
                 worldComDesired = preWalkComDes;
                 yawDes = initialYaw;
@@ -966,7 +1156,7 @@ int main(int argc, const char **argv)
                 gaitStarted = false;
                 robotState.legState = DataBus::DSt;
                 robotState.legStateNext = DataBus::LSt;
-                robotState.walk_stance_leg = DataBus::DSt;
+                robotState.walk_stance_leg = DataBus::RSt;
                 robotState.walk_left_contact = true;
                 robotState.walk_right_contact = true;
                 robotState.walk_is_double_support = true;
@@ -1029,25 +1219,53 @@ int main(int argc, const char **argv)
             const Eigen::Vector2d swingPhase = swingPhaseFromRobotState(robotState);
             const Eigen::Matrix<int, Eigen::Dynamic, G1KinodynamicsNmpc::kNumFeet> contactTable =
                 previewContactTable(robotState, options.horizon, options.mpcSegmentDt);
+            fillWalkBus(robotState, comDes, velDesWorld, yawDes, yawRateDes,
+                        leftContact, rightContact, nominalFootForce,
+                        walkingEnabled, targetComHeight);
             const bool contactModeChanged =
                 hasPreviousContactMode &&
                 (previousContactMode[0] != leftContact || previousContactMode[1] != rightContact);
             if (contactModeChanged)
             {
+                const bool swingLeft = !leftContact && rightContact;
+                const bool swingRight = leftContact && !rightContact;
+                const double swingFootZ = swingLeft ? robotState.fe_l_pos_W.z()
+                                         : swingRight ? robotState.fe_r_pos_W.z()
+                                                      : std::numeric_limits<double>::quiet_NaN();
+                const double swingDesZ = (swingLeft || swingRight)
+                                             ? robotState.swingDesPosCur_W.z()
+                                             : std::numeric_limits<double>::quiet_NaN();
+                const double stanceFootZ = swingLeft ? robotState.fe_r_pos_W.z()
+                                          : swingRight ? robotState.fe_l_pos_W.z()
+                                                       : std::numeric_limits<double>::quiet_NaN();
                 forceMpcSolve = true;
-                hasNmpcSolution = false;
-                nmpc.resetWarmStart();
-                lastWrenches = nominalContactWrench(leftContact, rightContact, modelMass);
-                lastJointAccelerations.setZero();
                 std::cout << "[ALIP-WALK] contact switch t=" << std::fixed << std::setprecision(3)
                           << time << " L/R=" << (leftContact ? 1 : 0) << "/"
                           << (rightContact ? 1 : 0)
-                          << " phi=" << std::setprecision(2) << robotState.phi << "\n";
+                          << " phi=" << std::setprecision(2) << robotState.phi
+                          << " swing_z/des/stance=" << std::setprecision(4)
+                          << swingFootZ << "/" << swingDesZ << "/" << stanceFootZ
+                          << " phase_t/t_impact=" << robotState.walk_phase_time
+                          << "/" << robotState.walk_time_to_impact;
+                if (options.printAlipFootstep && footPlacement.hasLastPlan)
+                {
+                    std::cout << " step_local=[" << footPlacement.lastHlipStepLocal.x()
+                              << "," << footPlacement.lastHlipStepLocal.y()
+                              << "] step_world=[" << footPlacement.lastPlannedStepWorld.x()
+                              << "," << footPlacement.lastPlannedStepWorld.y()
+                              << "," << footPlacement.lastPlannedStepWorld.z()
+                              << "] touchdown=[" << footPlacement.lastPlannedTouchdownWorld.x()
+                              << "," << footPlacement.lastPlannedTouchdownWorld.y()
+                              << "," << footPlacement.lastPlannedTouchdownWorld.z() << "]";
+                }
+                std::cout << "\n";
             }
             previousContactMode = {{leftContact, rightContact}};
             hasPreviousContactMode = true;
 
-            Eigen::Vector3d baseRef = initialBasePos + (comDes - initialCom);
+            const Eigen::Vector3d nmpcComRef =
+                walkingEnabled ? boundedComTrackingReference(comDes, robotState.pCoM_W) : comDes;
+            Eigen::Vector3d baseRef = initialBasePos + (nmpcComRef - initialCom);
             baseRef.z() = comDes.z() + baseMinusCom.z();
             robotState.base_pos_des = baseRef;
 
@@ -1069,6 +1287,8 @@ int main(int argc, const char **argv)
             const Eigen::Matrix3d rightFootRotLDes = baseRotRef.transpose() * rightFootRotWDes;
             const Pin_KinDyn::IkRes ikRes =
                 kinDyn.computeInK_Leg(leftFootRotLDes, leftFootPosLDes, rightFootRotLDes, rightFootPosLDes);
+            ikStatus = ikRes.status;
+            ikErrNorm = ikRes.err.norm();
             if (ikRes.err.norm() < 8e-2 && ikRes.jointPosRes.size() >= kLegMotorCount)
             {
                 ikStandPose.head(kLegMotorCount) = ikRes.jointPosRes.head(kLegMotorCount);
@@ -1096,7 +1316,9 @@ int main(int argc, const char **argv)
                 input.q = robotState.q;
                 input.v = robotState.dq;
                 input.qReference = qRef;
-                input.vReference = vRef;
+                input.vReference = Eigen::VectorXd::Zero(robotState.model_nv);
+                input.vReference.head<3>() = velDesWorld;
+                input.vReference.segment<3>(3) << 0.0, 0.0, yawRateDes;
                 input.footPoseReference = footPoseRef;
                 input.footPoseReferenceHorizon = footPoseRefHorizon;
                 input.contactActive = {{leftContact, rightContact}};
@@ -1135,6 +1357,20 @@ int main(int argc, const char **argv)
                                       1.0;
             tauFeedforward = inverseDynamicsFeedforward(robotState, lastWrenches, lastJointAccelerations,
                                                         ffRamp * options.ffScale, options.wrenchSign);
+            const Eigen::Vector2d waistTauRp = waistRpStabilizingTorque(robotState);
+            if (tauFeedforward.size() > kWaistRollMotor)
+            {
+                tauFeedforward(kWaistRollMotor) += ffRamp * options.ffScale * waistTauRp.x();
+            }
+            if (tauFeedforward.size() > kWaistPitchMotor)
+            {
+                tauFeedforward(kWaistPitchMotor) += ffRamp * options.ffScale * waistTauRp.y();
+            }
+            for (int i = 0; i < tauFeedforward.size(); ++i)
+            {
+                const double limit = g1_kin_dyn::motorTorqueLimit(i);
+                tauFeedforward(i) = std::clamp(tauFeedforward(i), -limit, limit);
+            }
 
             const double ikRamp = std::clamp(time / kIkRampTime, 0.0, 1.0);
             const Eigen::VectorXd motorPosDes = (1.0 - ikRamp) * standHoldPose + ikRamp * ikStandPose;
@@ -1149,10 +1385,13 @@ int main(int argc, const char **argv)
 
             if (options.print && time + 1e-12 >= nextPrintTime)
             {
-                printRuntimeSummary(time, robotState, comDes, velDesWorld, nmpc,
+                printRuntimeSummary(time, robotState, comDes, velDesWorld,
+                                    footDesW, mpcFootTouchdownW,
+                                    footPlacement, options.printAlipFootstep, nmpc,
                                     lastWrenches, lastJointAccelerations, tauFeedforward,
                                     swingPhase, gaitScheduler.stepNumCur,
                                     leftContact, rightContact,
+                                    ikStatus, ikErrNorm,
                                     options.ffScale, options.wrenchSign);
                 nextPrintTime += 1.0 / options.printHz;
                 if (nextPrintTime < time)
@@ -1175,6 +1414,8 @@ int main(int argc, const char **argv)
             logger.recItermData("wrench", lastWrenches);
             logger.recItermData("jointAcc", lastJointAccelerations);
             logger.recItermData("tau_ff", tauFeedforward);
+            logger.recItermData("ikStatus", static_cast<double>(ikStatus));
+            logger.recItermData("ikErrNorm", ikErrNorm);
             logger.recItermData("nmpcStatus", static_cast<double>(nmpc.status()));
             logger.recItermData("nmpcIter", static_cast<double>(nmpc.iterations()));
             logger.recItermData("nmpcCpuTime", nmpc.solveTime());

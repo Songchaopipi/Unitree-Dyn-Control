@@ -187,6 +187,11 @@ void FootPlacement::getSwingPos()
 
     if (!inSingleSupport)
     {
+        hasLastPlan = false;
+        lastHlipStepLocal.setZero();
+        lastPlannedStepBaseYaw.setZero();
+        lastPlannedStepWorld.setZero();
+        lastPlannedTouchdownWorld = posStart_W;
         yd.setZero(10);
         dyd.setZero(10);
         d2yd.setZero(10);
@@ -286,8 +291,9 @@ void FootPlacement::getSwingPos()
     Eigen::Vector2d stepLocalXY = PlanHlipFootstep(reducedState, tRemain, zNom,
                                                    tSwing, doubleSupportTime,
                                                    stepWidthNominal);
+    lastHlipStepLocal = stepLocalXY;
     Eigen::Vector3d stepInBaseYaw = Rz3(targetYaw - yawCur) * Eigen::Vector3d(stepLocalXY.x(), stepLocalXY.y(), 0.0);
-    const double lateralStepMin = 0.10;
+    const double lateralStepMin = 0.20;
     const double lateralStepMax = 0.60;
     if (legState == DataBus::LSt)
     {
@@ -297,11 +303,26 @@ void FootPlacement::getSwingPos()
     {
         stepInBaseYaw.y() = std::clamp(stepInBaseYaw.y(), lateralStepMin, lateralStepMax);
     }
-    const Eigen::Vector3d plannedStep_W = Rz3(yawCur) * stepInBaseYaw;
+    lastPlannedStepBaseYaw = stepInBaseYaw.head<2>();
+    Eigen::Vector3d plannedStep_W = Rz3(yawCur) * stepInBaseYaw;
+    const double stanceY = STPos_W.y();
+    double targetY = stanceY + plannedStep_W.y();
+    if (legState == DataBus::LSt)
+    {
+        targetY = std::clamp(targetY, stanceY - lateralStepMax, stanceY - lateralStepMin);
+    }
+    else
+    {
+        targetY = std::clamp(targetY, stanceY + lateralStepMin, stanceY + lateralStepMax);
+    }
+    plannedStep_W.y() = targetY - stanceY;
     lockedFinalTarget_W = STPos_W + plannedStep_W;
     lockedFinalTarget_W(2) = STPos_W(2) - 0.01;
     lastFinalTargetY = lockedFinalTarget_W(1);
     posDes_W = lockedFinalTarget_W;
+    hasLastPlan = true;
+    lastPlannedStepWorld = plannedStep_W;
+    lastPlannedTouchdownWorld = posDes_W;
 
     const Eigen::VectorXd swingHorizontalBlend =
         (Eigen::VectorXd(5) << 0.0, 0.0, 1.0, 1.0, 1.0).finished();

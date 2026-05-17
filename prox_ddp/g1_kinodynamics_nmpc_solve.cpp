@@ -134,37 +134,40 @@ bool G1KinodynamicsNmpc::solve(const Input &input)
     const double runOtherTime = std::max(0.0, solverRunTime - derivativeTime - ddpTime);
     const double wrapperOtherTime = std::max(0.0, solveTime_ - solverTotalTime);
 
-    std::ostringstream timingOut;
-    timingOut << "[Kino-NMPC] prox-ddp timing"
-              << " iter=" << iterations_
-              << " total_ms=" << std::fixed << std::setprecision(3) << solverTotalTime * 1e3
-              << " setup_ms=" << solverSetupTime * 1e3
-              << " run_ms=" << solverRunTime * 1e3
-              << " eval_ms=" << evaluateTime * 1e3
-              << " derivatives_ms=" << derivativeTime * 1e3
-              << " lagrangian_ms=" << lagrangianTime * 1e3
-              << " criterion_ms=" << criterionTime * 1e3
-              << " proj_jac_ms=" << projectedJacobianTime * 1e3
-              << " ddp_ms=" << ddpTime * 1e3
-              << " lq_update_ms=" << lqUpdateTime * 1e3
-              << " lq_backward_ms=" << lqBackwardTime * 1e3
-              << " lq_forward_ms=" << lqForwardTime * 1e3
-              << " feedback_ms=" << feedbackTime * 1e3
-              << " line_search_ms=" << lineSearchTime * 1e3
-              << " forward_pass_ms=" << forwardPassTime * 1e3
-              << " rollout_ms=" << rolloutTime * 1e3
-              << " multipliers_ms=" << multipliersTime * 1e3
-              << " merit_ms=" << meritTime * 1e3
-              << " forward_pass_count=" << forwardPassCount
-              << " run_other_ms=" << runOtherTime * 1e3
-              << " wrapper_other_ms=" << wrapperOtherTime * 1e3
-              << " cache=" << (rebuiltSolverCache ? "rebuild" : "reuse")
-              << " rollout=" << (useLinearRollout || useParallelLq ? "linear" : "nonlinear")
-              << " lq_solver=" << (useParallelLq ? "parallel" : "serial")
-              << " threads=" << std::max(1, numThreads)
-              << " contact_dual_reset=" << std::boolalpha << resetDualsForContactSwitch
-              << " conv=" << std::boolalpha << solver.results_.conv;
-    std::cout << timingOut.str() << std::endl;
+    if (logTiming)
+    {
+        std::ostringstream timingOut;
+        timingOut << "[Kino-NMPC] prox-ddp timing"
+                  << " iter=" << iterations_
+                  << " total_ms=" << std::fixed << std::setprecision(3) << solverTotalTime * 1e3
+                  << " setup_ms=" << solverSetupTime * 1e3
+                  << " run_ms=" << solverRunTime * 1e3
+                  << " eval_ms=" << evaluateTime * 1e3
+                  << " derivatives_ms=" << derivativeTime * 1e3
+                  << " lagrangian_ms=" << lagrangianTime * 1e3
+                  << " criterion_ms=" << criterionTime * 1e3
+                  << " proj_jac_ms=" << projectedJacobianTime * 1e3
+                  << " ddp_ms=" << ddpTime * 1e3
+                  << " lq_update_ms=" << lqUpdateTime * 1e3
+                  << " lq_backward_ms=" << lqBackwardTime * 1e3
+                  << " lq_forward_ms=" << lqForwardTime * 1e3
+                  << " feedback_ms=" << feedbackTime * 1e3
+                  << " line_search_ms=" << lineSearchTime * 1e3
+                  << " forward_pass_ms=" << forwardPassTime * 1e3
+                  << " rollout_ms=" << rolloutTime * 1e3
+                  << " multipliers_ms=" << multipliersTime * 1e3
+                  << " merit_ms=" << meritTime * 1e3
+                  << " forward_pass_count=" << forwardPassCount
+                  << " run_other_ms=" << runOtherTime * 1e3
+                  << " wrapper_other_ms=" << wrapperOtherTime * 1e3
+                  << " cache=" << (rebuiltSolverCache ? "rebuild" : "reuse")
+                  << " rollout=" << (useLinearRollout || useParallelLq ? "linear" : "nonlinear")
+                  << " lq_solver=" << (useParallelLq ? "parallel" : "serial")
+                  << " threads=" << std::max(1, numThreads)
+                  << " contact_dual_reset=" << std::boolalpha << resetDualsForContactSwitch
+                  << " conv=" << std::boolalpha << solver.results_.conv;
+        std::cout << timingOut.str() << std::endl;
+    }
 
     if (solver.results_.us.empty() || solver.results_.xs.empty())
     {

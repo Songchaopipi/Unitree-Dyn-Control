@@ -26,6 +26,11 @@ public:
     Eigen::Vector3d desV_W, curV_W;
     Eigen::Vector3d swingVelDes_W{Eigen::Vector3d::Zero()};
     Eigen::Vector3d swingAccDes_W{Eigen::Vector3d::Zero()};
+    bool hasLastPlan{false};
+    Eigen::Vector2d lastHlipStepLocal{Eigen::Vector2d::Zero()};
+    Eigen::Vector2d lastPlannedStepBaseYaw{Eigen::Vector2d::Zero()};
+    Eigen::Vector3d lastPlannedStepWorld{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d lastPlannedTouchdownWorld{Eigen::Vector3d::Zero()};
     Eigen::VectorXd yd{Eigen::VectorXd::Zero(10)};
     Eigen::VectorXd dyd{Eigen::VectorXd::Zero(10)};
     Eigen::VectorXd d2yd{Eigen::VectorXd::Zero(10)};

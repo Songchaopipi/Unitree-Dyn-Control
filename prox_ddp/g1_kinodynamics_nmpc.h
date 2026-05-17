@@ -119,6 +119,8 @@ public:
     bool useForceCone{true};
     // 参数说明：是否对支撑脚添加零速度等式约束。
     bool constrainStandingFeet{true};
+    // 参数说明：是否打印 ProxDDP 细分耗时；默认关闭，避免调试步态时刷屏。
+    bool logTiming{false};
 
 private:
     pinocchio::Model model_;

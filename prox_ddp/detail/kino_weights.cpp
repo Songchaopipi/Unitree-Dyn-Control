@@ -34,7 +34,8 @@ Eigen::VectorXd makeStateWeightDiagonal(int nv)
         }
     }
 
-    w.segment<3>(nv) << 4.0, 4.0, 8.0;
+    // 行走时水平速度参考直接决定接触切向力，权重太小会导致 NMPC 只看位置误差但不主动追速度。
+    w.segment<3>(nv) << 25.0, 25.0, 8.0;
     w.segment<3>(nv + 3) << 20.0, 20.0, 8.0;
     for (int i = 0; i < actuated; ++i)
     {
