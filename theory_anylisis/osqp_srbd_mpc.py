@@ -12,11 +12,14 @@ from math_utils import (
     GRAVITY,
     foot_wrench_cone,
     nominal_vertical_wrench,
-    rz,
-    skew,
 )
 from models import MpcParams, RobotParams
 from osqp_compat import setup_osqp
+
+try:
+    from .dynamics import srbd_augmented_discrete_matrices
+except ImportError:
+    from dynamics import srbd_augmented_discrete_matrices
 
 try:
     import osqp  # type: ignore
@@ -52,34 +55,16 @@ class OsqpSrbdMpc:
         contact_positions_horizon: list[np.ndarray],
         knot: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        nx, nu = 13, 12
-        A = np.eye(nx)
-        B = np.zeros((nx, nu))
-        Iw = R @ self.robot.inertia_body @ R.T
-        Iinv = np.linalg.inv(Iw)
-
-        Ac = np.zeros((nx, nx))
-        Ac[0:3, 6:9] = rz(x_current[2])
-        Ac[3:6, 9:12] = np.eye(3)
-        Ac[11, 12] = -1.0
-
         com = reference[3:6, knot] if knot < reference.shape[1] else x_current[3:6]
-        contact_positions = contact_positions_horizon[knot]
-        Bc = np.zeros((nx, nu))
-        for leg in range(2):
-            r = contact_positions[leg] - com
-            wrench_to_centroidal = np.zeros((6, 6))
-            wrench_to_centroidal[0:3, 0:3] = np.eye(3)
-            wrench_to_centroidal[3:6, 0:3] = skew(r)
-            wrench_to_centroidal[3:6, 3:6] = np.eye(3)
-            col = 6 * leg
-            Bc[9:12, col : col + 6] = wrench_to_centroidal[0:3, :] / self.robot.mass
-            Bc[6:9, col : col + 6] = Iinv @ wrench_to_centroidal[3:6, :]
-
-        dt = self.params.dt
-        A += dt * Ac
-        B = dt * Bc
-        return A, B
+        return srbd_augmented_discrete_matrices(
+            dt=self.params.dt,
+            mass=self.robot.mass,
+            inertia_body=self.robot.inertia_body,
+            yaw=float(x_current[2]),
+            com=com,
+            contact_positions=contact_positions_horizon[knot],
+            R=R,
+        )
 
     def _condense(
         self,
